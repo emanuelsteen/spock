@@ -15,6 +15,7 @@
 #include "storage/lock.h"
 
 #include "spock.h"
+#include "spock_output_plugin.h"	/* for SpockOutputSlotGroup */
 
 typedef enum {
 	SPOCK_WORKER_NONE,		/* Unused slot. */
@@ -80,6 +81,14 @@ typedef struct SpockContext {
 
 	/* Signal that subscription info have changed. */
 	bool		subscriptions_changed;
+
+	/* cluster read-only global flag */
+	bool		cluster_is_readonly;
+
+	/* Spock slot-group data */
+	LWLock				   *slot_group_master_lock;
+	int						slot_ngroups;
+	SpockOutputSlotGroup   *slot_groups;
 
 	/* Background workers. */
 	int			total_workers;

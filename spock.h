@@ -25,8 +25,8 @@
 
 #include "spock_compat.h"
 
-#define SPOCK_VERSION "3.1"
-#define SPOCK_VERSION_NUM 30100
+#define SPOCK_VERSION "3.2"
+#define SPOCK_VERSION_NUM 30200
 
 #define SPOCK_MIN_PROTO_VERSION_NUM 1
 #define SPOCK_MAX_PROTO_VERSION_NUM 1
@@ -107,5 +107,7 @@ extern bool in_spock_replicate_ddl_command;
 pg_attribute_printf(1, 2) pg_attribute_unused() static inline void VALGRIND_PRINTF(const char *format, ...) {}
 
 #endif
+
+extern void spock_init_failover_slot(void);
 
 #endif /* SPOCK_H */

@@ -379,18 +379,37 @@ CREATE VIEW spock.lag_tracker AS
 
 
 CREATE FUNCTION spock.md5_agg_sfunc(text, anyelement) 
-       RETURNS text
-       LANGUAGE sql
+	RETURNS text
+	LANGUAGE sql
 AS
 $$
-  SELECT md5($1 || $2::text)
+	SELECT md5($1 || $2::text)
 $$;
 CREATE  AGGREGATE spock.md5_agg (ORDER BY anyelement)
 (
-  STYPE = text,
-  SFUNC = spock.md5_agg_sfunc,
-  INITCOND = ''
+	STYPE = text,
+	SFUNC = spock.md5_agg_sfunc,
+	INITCOND = ''
 );
+
+-- ----------------------------------------------------------------------
+-- Spock Read Only
+-- ----------------------------------------------------------------------
+CREATE FUNCTION spock.set_cluster_readonly() RETURNS bool
+ AS 'MODULE_PATHNAME', 'spockro_set_readonly'
+ LANGUAGE C STRICT;
+
+CREATE FUNCTION spock.unset_cluster_readonly() RETURNS bool
+ AS 'MODULE_PATHNAME', 'spockro_unset_readonly'
+ LANGUAGE C STRICT;
+
+CREATE FUNCTION spock.get_cluster_readonly() RETURNS bool
+ AS 'MODULE_PATHNAME', 'spockro_get_readonly'
+ LANGUAGE C STRICT;
+
+CREATE FUNCTION spock.terminate_active_transactions() RETURNS bool
+ AS 'MODULE_PATHNAME', 'spockro_terminate_active_transactions'
+ LANGUAGE C STRICT;
 
 -- ----------------------------------------------------------------------
 -- We check the PostgreSQL major version number in case a future
@@ -404,7 +423,7 @@ BEGIN
 	pgmajor = regexp_replace(regexp_replace(version(), '^PostgreSQL ', ''), '[^0-9].*', '')::integer;
 
 	CASE
-		WHEN pgmajor IN (15, 16, 17) THEN
+		WHEN pgmajor IN (14, 15, 16, 17) THEN
 
 -- ----------------------------------------------------------------------
 -- convert_column_to_int8()

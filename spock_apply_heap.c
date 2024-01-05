@@ -97,10 +97,12 @@ typedef struct ApplyMIState
 
 static ApplyMIState *spkmistate = NULL;
 
+#ifndef NO_LOG_OLD_VALUE
 static bool relation_has_delta_columns(SpockRelation *rel);
 static void build_delta_tuple(SpockRelation *rel, SpockTupleData *oldtup,
 							  SpockTupleData *newtup, SpockTupleData *deltatup,
 							  TupleTableSlot *localslot);
+#endif
 
 void
 spock_apply_heap_begin(void)
@@ -281,6 +283,8 @@ fill_missing_defaults(SpockRelation *rel, EState *estate,
 												NULL);
 }
 
+#ifndef NO_LOG_OLD_VALUE
+
 static bool
 relation_has_delta_columns(SpockRelation *rel)
 {
@@ -427,6 +431,7 @@ build_delta_tuple(SpockRelation *rel, SpockTupleData *oldtup,
 		}
 	}
 }
+#endif /* NO_LOG_OLD_VALUE */
 
 static ApplyExecState *
 init_apply_exec_state(SpockRelation *rel)
@@ -469,7 +474,10 @@ finish_apply_exec_state(ApplyExecState *aestate)
 
 	/* Terminate EPQ execution if active. */
 	if (aestate->resultRelInfo->ri_TrigDesc)
+	{
 		EvalPlanQualEnd(&aestate->epqstate);
+		ExecCloseResultRelations(aestate->estate);
+	}
 
 	/* Cleanup tuple table. */
 	ExecResetTupleTable(aestate->estate->es_tupleTable, true);
@@ -757,6 +765,7 @@ spock_apply_heap_update(SpockRelation *rel, SpockTupleData *oldtup,
 			applytuple = remotetuple;
 		}
 
+#ifndef NO_LOG_OLD_VALUE
 		/*
 		 * If the relation has columns that are marked LOG_OLD_VALUE
 		 * we apply the delta between the remote new and old values.
@@ -802,6 +811,7 @@ spock_apply_heap_update(SpockRelation *rel, SpockTupleData *oldtup,
 									 SPOCK_STATS_DCA_COUNT, 1);
 			}
 		}
+#endif /* NO_LOG_OLD_VALUE */
 
 		if (apply)
 		{

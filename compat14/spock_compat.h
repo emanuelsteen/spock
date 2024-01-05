@@ -3,7 +3,7 @@
  * spock_compat.h
  *             compatibility functions (mainly with different PG versions) 
  *
- * Copyright (c) 2021-2023, pgEdge
+ * Copyright (c) 2021-2022, OSCG Partners, LLC
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -33,7 +33,7 @@
 #define GetCurrentIntegerTimestamp() GetCurrentTimestamp()
 
 #define pg_analyze_and_rewrite(parsetree, query_string, paramTypes, numParams) \
-	pg_analyze_and_rewrite_fixedparams(parsetree, query_string, paramTypes, numParams, NULL)
+	pg_analyze_and_rewrite(parsetree, query_string, paramTypes, numParams, NULL)
 
 #define CreateCommandTag(raw_parsetree) \
 	CreateCommandTag(raw_parsetree->stmt)
@@ -47,9 +47,6 @@
 #define ExecBRDeleteTriggers(estate, epqstate, relinfo, tupleid, fdw_trigtuple) \
  	ExecBRDeleteTriggers(estate, epqstate, relinfo, tupleid, fdw_trigtuple, NULL)
 
-#define ExecBRUpdateTriggers(estate, epqstate, relinfo, tupleid, fdw_trigtuple, slot) \
-	ExecBRUpdateTriggers(estate, epqstate, relinfo, tupleid, fdw_trigtuple, slot, NULL)
-
 #undef ExecEvalExpr
 #define ExecEvalExpr(expr, econtext, isNull, isDone) \
 	((*(expr)->evalfunc) (expr, econtext, isNull))
@@ -60,13 +57,13 @@
 	InitResultRelInfo(resultRelInfo, resultRelationDesc, resultRelationIndex, NULL, instrument_options)
 
 #define ExecARUpdateTriggers(estate, relinfo, tupleid, fdw_trigtuple, newslot, recheckIndexes) \
-	ExecARUpdateTriggers(estate, relinfo, NULL, NULL, tupleid, fdw_trigtuple, newslot, recheckIndexes, NULL, false)
+	ExecARUpdateTriggers(estate, relinfo, tupleid, fdw_trigtuple, newslot, recheckIndexes, NULL)
 
 #define ExecARInsertTriggers(estate, relinfo, slot, recheckIndexes) \
 	ExecARInsertTriggers(estate, relinfo, slot, recheckIndexes, NULL)
 
 #define ExecARDeleteTriggers(estate, relinfo, tupleid, fdw_trigtuple) \
-	ExecARDeleteTriggers(estate, relinfo, tupleid, fdw_trigtuple, NULL, false)
+	ExecARDeleteTriggers(estate, relinfo, tupleid, fdw_trigtuple, NULL)
 
 #define makeDefElem(name, arg) makeDefElem(name, arg, -1)
 
@@ -107,6 +104,9 @@
 #define getObjectDescription(object) getObjectDescription(object, false)
 #define addRTEPermissionInfo(rteperminfos, rte) \
 	*rteperminfos = NIL;
+
+#define OutputPluginUpdateProgress(ctx, false) \
+			OutputPluginUpdateProgress(ctx)
 
 #define SwitchToUntrustedUser(userid, context) ((void)0)
 #define RestoreUserContext(context) ((void)0)
