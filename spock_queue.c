@@ -3,7 +3,7 @@
  * spock_queue.c
  *		spock queue and connection catalog manipulation functions
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -27,7 +27,8 @@
 #include "catalog/pg_type.h"
 
 #include "commands/extension.h"
-#include "commands/trigger.h"
+
+#include "executor/spi.h"
 
 #include "miscadmin.h"
 
@@ -44,7 +45,9 @@
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 
+#include "spock_common.h"
 #include "spock_queue.h"
+#include "spock_repset.h"
 #include "spock.h"
 
 #define CATALOG_QUEUE	"queue"
@@ -181,71 +184,4 @@ get_queue_table_oid(void)
 		queuetableoid = get_spock_table_oid(CATALOG_QUEUE);
 
 	return queuetableoid;
-}
-
-
-/*
- * Create a TRUNCATE trigger for a persistent table and mark
- * it tgisinternal so that it's not dumped by pg_dump.
- *
- * This is basically wrapper around CreateTrigger().
- */
-void
-create_truncate_trigger(Relation rel)
-{
-	CreateTrigStmt *tgstmt;
-	ObjectAddress	trgobj;
-	ObjectAddress	extension;
-	Oid			fargtypes[1];
-	List	   *funcname = list_make2(makeString(EXTENSION_NAME),
-									  makeString("queue_truncate"));
-
-	/*
-	 * Check for already existing trigger on the table to avoid adding
-	 * duplicate ones.
-	 */
-	if (rel->trigdesc)
-	{
-		Trigger	   *trigger = rel->trigdesc->triggers;
-		int			i;
-		Oid			funcoid = LookupFuncName(funcname, 0, fargtypes, false);
-
-		for (i = 0; i < rel->trigdesc->numtriggers; i++)
-		{
-			if (!TRIGGER_FOR_TRUNCATE(trigger->tgtype))
-				continue;
-
-			if (trigger->tgfoid == funcoid)
-				return;
-
-			trigger++;
-		}
-	}
-
-	tgstmt = makeNode(CreateTrigStmt);
-	tgstmt->trigname = "queue_truncate_trigger";
-	tgstmt->relation = NULL;
-	tgstmt->funcname = funcname;
-	tgstmt->args = NIL;
-	tgstmt->row = false;
-	tgstmt->timing = TRIGGER_TYPE_AFTER;
-	tgstmt->events = TRIGGER_TYPE_TRUNCATE;
-	tgstmt->columns = NIL;
-	tgstmt->whenClause = NULL;
-	tgstmt->isconstraint = false;
-	tgstmt->deferrable = false;
-	tgstmt->initdeferred = false;
-	tgstmt->constrrel = NULL;
-
-	trgobj = SPKCreateTrigger(tgstmt, NULL, RelationGetRelid(rel), InvalidOid,
-							  InvalidOid, InvalidOid, true /* tgisinternal */);
-
-	extension.classId = ExtensionRelationId;
-	extension.objectId = get_extension_oid(EXTENSION_NAME, false);
-	extension.objectSubId = 0;
-
-	recordDependencyOn(&trgobj, &extension, DEPENDENCY_AUTO);
-
-	/* Make the new trigger visible within this session */
-	CommandCounterIncrement();
 }

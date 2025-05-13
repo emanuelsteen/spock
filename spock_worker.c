@@ -3,7 +3,7 @@
  * spock.c
  * 		spock initialization and common functionality
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -21,7 +21,12 @@
 #include "commands/dbcommands.h"
 #include "common/hashfn.h"
 
+#include "catalog/dependency.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_type.h"
+
 #include "nodes/makefuncs.h"
+#include "postmaster/interrupt.h"
 
 #include "storage/ipc.h"
 #include "storage/proc.h"
@@ -32,6 +37,8 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
+#include "utils/builtins.h"
 #include "replication/origin.h"
 #include "replication/slot.h"
 
@@ -40,25 +47,25 @@
 #include "spock_sync.h"
 #include "spock_worker.h"
 #include "spock_conflict.h"
-
+#include "spock_relcache.h"
+#include "spock_exception_handler.h"
 
 typedef struct signal_worker_item
 {
-	Oid		subid;
-	bool	kill;
+	Oid			subid;
+	bool		kill;
 } signal_worker_item;
-static	List *signal_workers = NIL;
+static List *signal_workers = NIL;
 
-volatile sig_atomic_t	got_SIGTERM = false;
+volatile sig_atomic_t got_SIGTERM = false;
 
-HTAB			   *LagTrackerHash = NULL;
-HTAB			   *SpockHash = NULL;
-SpockContext	   *SpockCtx = NULL;
-SpockWorker		   *MySpockWorker = NULL;
-static uint16		MySpockWorkerGeneration;
-int					spock_stats_max_entries_conf = -1;
-int					spock_stats_max_entries;
-bool				spock_stats_hash_full = false;
+HTAB	   *SpockHash = NULL;
+SpockContext *SpockCtx = NULL;
+SpockWorker *MySpockWorker = NULL;
+static uint16 MySpockWorkerGeneration;
+int			spock_stats_max_entries_conf = -1;
+int			spock_stats_max_entries;
+bool		spock_stats_hash_full = false;
 
 
 static bool xacthook_signal_workers = false;
@@ -97,16 +104,16 @@ handle_sigterm(SIGNAL_ARGS)
 static int
 find_empty_worker_slot(Oid dboid)
 {
-	int	i;
+	int			i;
 
 	Assert(LWLockHeldByMe(SpockCtx->lock));
 
 	for (i = 0; i < SpockCtx->total_workers; i++)
 	{
 		if (SpockCtx->workers[i].worker_type == SPOCK_WORKER_NONE
-		    || (SpockCtx->workers[i].crashed_at != 0
-                && (SpockCtx->workers[i].dboid == dboid
-                    || SpockCtx->workers[i].dboid == InvalidOid)))
+			|| (SpockCtx->workers[i].terminated_at != 0
+				&& (SpockCtx->workers[i].dboid == dboid
+					|| SpockCtx->workers[i].dboid == InvalidOid)))
 			return i;
 	}
 
@@ -121,11 +128,11 @@ find_empty_worker_slot(Oid dboid)
 int
 spock_worker_register(SpockWorker *worker)
 {
-	BackgroundWorker	bgw;
-	SpockWorker		*worker_shm;
+	BackgroundWorker bgw;
+	SpockWorker *worker_shm;
 	BackgroundWorkerHandle *bgw_handle;
-	int					slot;
-	int					next_generation;
+	int			slot;
+	int			next_generation;
 
 	Assert(worker->worker_type != SPOCK_WORKER_NONE);
 
@@ -151,14 +158,15 @@ spock_worker_register(SpockWorker *worker)
 
 	memcpy(worker_shm, worker, sizeof(SpockWorker));
 	worker_shm->generation = next_generation;
-	worker_shm->crashed_at = 0;
+	worker_shm->terminated_at = 0;
+	worker_shm->restart_delay = restart_delay_default;
 	worker_shm->proc = NULL;
 	worker_shm->worker_type = worker->worker_type;
 
 	LWLockRelease(SpockCtx->lock);
 
 	memset(&bgw, 0, sizeof(bgw));
-	bgw.bgw_flags =	BGWORKER_SHMEM_ACCESS |
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
 	snprintf(bgw.bgw_library_name, BGW_MAXLEN,
@@ -194,7 +202,7 @@ spock_worker_register(SpockWorker *worker)
 
 	if (!RegisterDynamicBackgroundWorker(&bgw, &bgw_handle))
 	{
-		worker_shm->crashed_at = GetCurrentTimestamp();
+		worker_shm->terminated_at = GetCurrentTimestamp();
 		ereport(ERROR,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("worker registration failed, you might want to increase max_worker_processes setting")));
@@ -242,13 +250,11 @@ wait_for_worker_startup(SpockWorker *worker,
 		if (status == BGWH_STOPPED)
 		{
 			/*
-			 * The worker may have:
-			 * - failed to launch after registration
-			 * - launched then crashed/exited before attaching
-			 * - launched, attached, done its work, detached cleanly and exited
-			 *   before we got rescheduled
-			 * - launched, attached, crashed and self-reported its crash, then
-			 *   exited before we got rescheduled
+			 * The worker may have: - failed to launch after registration -
+			 * launched then crashed/exited before attaching - launched,
+			 * attached, done its work, detached cleanly and exited before we
+			 * got rescheduled - launched, attached, crashed and self-reported
+			 * its crash, then exited before we got rescheduled
 			 *
 			 * If it detached cleanly it will've set its worker type to
 			 * SPOCK_WORKER_NONE, which it can't have been at entry, so we
@@ -261,28 +267,28 @@ wait_for_worker_startup(SpockWorker *worker,
 			 * on registration to tell the difference. If the generation
 			 * counter has increased we know the our worker must've exited
 			 * cleanly (setting the worker type back to NONE) or self-reported
-			 * a crash (setting crashed_at), then the slot re-used by another
+			 * a crash (setting terminated_at), then the slot re-used by another
 			 * manager.
 			 */
 			if (worker->worker_type != SPOCK_WORKER_NONE
 				&& worker->generation == generation
-				&& worker->crashed_at == 0)
+				&& worker->terminated_at == 0)
 			{
 				/*
 				 * The worker we launched (same generation) crashed before
-				 * attaching to shmem so it didn't set crashed_at. Mark it
+				 * attaching to shmem so it didn't set terminated_at. Mark it
 				 * crashed so the slot can be re-used.
 				 */
 				elog(DEBUG2, "%s worker at slot %zu exited prematurely",
 					 spock_worker_type_name(worker->worker_type), (worker - &SpockCtx->workers[0]));
-				worker->crashed_at = GetCurrentTimestamp();
+				worker->terminated_at = GetCurrentTimestamp();
 			}
 			else
 			{
 				/*
-				 * Worker exited normally or self-reported a crash and may have already been
-				 * replaced. Either way, we don't care, we're only looking for crashes before
-				 * shmem attach.
+				 * Worker exited normally or self-reported a crash and may
+				 * have already been replaced. Either way, we don't care,
+				 * we're only looking for crashes before shmem attach.
 				 */
 				elog(DEBUG2, "%s worker at slot %zu exited before we noticed it started",
 					 spock_worker_type_name(worker->worker_type), (worker - &SpockCtx->workers[0]));
@@ -327,12 +333,12 @@ spock_worker_attach(int slot, SpockWorkerType type)
 
 	/*
 	 * Establish signal handlers. We must do this before unblocking the
-	 * signals. The default SIGTERM handler of Postgres's background
-	 * worker processes otherwise might throw a FATAL error, forcing us
-	 * to exit while potentially holding a spinlock and/or corrupt
-	 * shared memory.
+	 * signals. The default SIGTERM handler of Postgres's background worker
+	 * processes otherwise might throw a FATAL error, forcing us to exit while
+	 * potentially holding a spinlock and/or corrupt shared memory.
 	 */
 	pqsignal(SIGTERM, handle_sigterm);
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 
 	/* Now safe to process signals */
 	BackgroundWorkerUnblockSignals();
@@ -344,12 +350,13 @@ spock_worker_attach(int slot, SpockWorkerType type)
 	before_shmem_exit(spock_worker_on_exit, (Datum) 0);
 
 	MySpockWorker = &SpockCtx->workers[slot];
+
 	Assert(MySpockWorker->proc == NULL);
 	Assert(MySpockWorker->worker_type == type);
+
 	MySpockWorker->proc = MyProc;
 	MySpockWorkerGeneration = MySpockWorker->generation;
-	MySpockWorker->worker.apply.replorigin = InvalidRepOriginId;
-	MySpockWorker->worker.apply.last_ts = 0;
+	MySpockWorker->worker.apply.apply_group = NULL;
 
 	elog(DEBUG2, "%s worker [%d] attaching to slot %d generation %hu",
 		 spock_worker_type_name(type), MyProcPid, slot,
@@ -360,8 +367,8 @@ spock_worker_attach(int slot, SpockWorkerType type)
 	 * request to print to the Valgrind log.
 	 */
 	VALGRIND_PRINTF("SPOCK: spock worker %s (%s)\n",
-		spock_worker_type_name(type),
-		MyBgworkerEntry->bgw_name);
+					spock_worker_type_name(type),
+					MyBgworkerEntry->bgw_name);
 
 	LWLockRelease(SpockCtx->lock);
 
@@ -376,8 +383,8 @@ spock_worker_attach(int slot, SpockWorkerType type)
 
 		BackgroundWorkerInitializeConnectionByOid(MySpockWorker->dboid,
 												  InvalidOid
-												  , 0 /* flags */
-												  );
+												  ,0	/* flags */
+			);
 
 
 		StartTransactionCommand();
@@ -396,6 +403,8 @@ spock_worker_attach(int slot, SpockWorkerType type)
 static void
 spock_worker_detach(bool crash)
 {
+	bool	signal_manager = false;
+
 	/* Nothing to detach. */
 	if (MySpockWorker == NULL)
 		return;
@@ -413,32 +422,49 @@ spock_worker_detach(bool crash)
 		 crash ? "exiting with error" : "detaching cleanly");
 
 	VALGRIND_PRINTF("SPOCK: worker detaching, unclean=%d\n",
-		crash);
+					crash);
 
 	/*
 	 * If we crashed we need to report it.
 	 *
-	 * The crash logic only works because all of the workers are attached
-	 * to shmem and the serious crashes that we can't catch here cause
-	 * postmaster to restart whole server killing all our workers and cleaning
-	 * shmem so we start from clean state in that scenario.
+	 * The crash logic only works because all of the workers are attached to
+	 * shmem and the serious crashes that we can't catch here cause postmaster
+	 * to restart whole server killing all our workers and cleaning shmem so
+	 * we start from clean state in that scenario.
 	 *
 	 * It's vital NOT to clear or change the generation field here; see
 	 * wait_for_worker_startup(...).
 	 */
 	if (crash)
 	{
-		MySpockWorker->crashed_at = GetCurrentTimestamp();
+		MySpockWorker->terminated_at = GetCurrentTimestamp();
 
-		/* Manager crash, make sure supervisor notices. */
+		/*
+		 * If a database manager terminates, inform the Spock supervisor.
+		 * Otherwise inform the Spock manager for this database so that
+		 * it can restart terminated apply-workers immediately (if
+		 * necessary).
+		 */
 		if (MySpockWorker->worker_type == SPOCK_WORKER_MANAGER)
 			SpockCtx->subscriptions_changed = true;
+		else
+			signal_manager = true;
 	}
 	else
 	{
 		/* Worker has finished work, clean up its state from shmem. */
 		MySpockWorker->worker_type = SPOCK_WORKER_NONE;
 		MySpockWorker->dboid = InvalidOid;
+	}
+
+	if (signal_manager)
+	{
+		SpockWorker	   *my_manager;
+
+		my_manager = spock_manager_find(MySpockWorker->dboid);
+
+		if (my_manager != NULL)
+			SetLatch(&my_manager->proc->procLatch);
 	}
 
 	MySpockWorker = NULL;
@@ -452,7 +478,7 @@ spock_worker_detach(bool crash)
 SpockWorker *
 spock_manager_find(Oid dboid)
 {
-	int i;
+	int			i;
 
 	Assert(LWLockHeldByMe(SpockCtx->lock));
 
@@ -472,13 +498,13 @@ spock_manager_find(Oid dboid)
 SpockWorker *
 spock_apply_find(Oid dboid, Oid subscriberid)
 {
-	int i;
+	int			i;
 
 	Assert(LWLockHeldByMe(SpockCtx->lock));
 
 	for (i = 0; i < SpockCtx->total_workers; i++)
 	{
-		SpockWorker	   *w = &SpockCtx->workers[i];
+		SpockWorker *w = &SpockCtx->workers[i];
 
 		if (w->worker_type == SPOCK_WORKER_APPLY &&
 			dboid == w->dboid &&
@@ -516,13 +542,14 @@ spock_apply_find_all(Oid dboid)
 SpockWorker *
 spock_sync_find(Oid dboid, Oid subscriberid, const char *nspname, const char *relname)
 {
-	int i;
+	int			i;
 
 	Assert(LWLockHeldByMe(SpockCtx->lock));
 
 	for (i = 0; i < SpockCtx->total_workers; i++)
 	{
 		SpockWorker *w = &SpockCtx->workers[i];
+
 		if (w->worker_type == SPOCK_WORKER_SYNC && dboid == w->dboid &&
 			subscriberid == w->worker.apply.subid &&
 			strcmp(NameStr(w->worker.sync.nspname), nspname) == 0 &&
@@ -548,6 +575,7 @@ spock_sync_find_all(Oid dboid, Oid subscriberid)
 	for (i = 0; i < SpockCtx->total_workers; i++)
 	{
 		SpockWorker *w = &SpockCtx->workers[i];
+
 		if (w->worker_type == SPOCK_WORKER_SYNC && dboid == w->dboid &&
 			subscriberid == w->worker.apply.subid)
 			res = lappend(res, w);
@@ -575,6 +603,15 @@ spock_worker_running(SpockWorker *worker)
 	return worker && worker->proc;
 }
 
+/*
+ * Is the worker terminating?
+ */
+bool
+spock_worker_terminating(SpockWorker *worker)
+{
+	return worker && worker->proc && worker->terminated_at != 0;
+}
+
 void
 spock_worker_kill(SpockWorker *worker)
 {
@@ -593,12 +630,12 @@ signal_worker_xact_callback(XactEvent event, void *arg)
 {
 	if (event == XACT_EVENT_COMMIT && xacthook_signal_workers)
 	{
-		SpockWorker	   *w;
-		ListCell	   *l;
+		SpockWorker *w;
+		ListCell   *l;
 
 		LWLockAcquire(SpockCtx->lock, LW_EXCLUSIVE);
 
-		foreach (l, signal_workers)
+		foreach(l, signal_workers)
 		{
 			signal_worker_item *item = (signal_worker_item *) lfirst(l);
 
@@ -646,7 +683,7 @@ spock_subscription_changed(Oid subid, bool kill)
 
 	if (OidIsValid(subid))
 	{
-		MemoryContext	oldcxt;
+		MemoryContext oldcxt;
 		signal_worker_item *item;
 
 		oldcxt = MemoryContextSwitchTo(TopTransactionContext);
@@ -666,11 +703,13 @@ spock_subscription_changed(Oid subid, bool kill)
 static Size
 worker_shmem_size(int nworkers, bool include_hash)
 {
-	Size	num_bytes = 0;
+	Size		num_bytes = 0;
 
 	num_bytes = offsetof(SpockContext, workers);
 	num_bytes = add_size(num_bytes,
 						 sizeof(SpockWorker) * nworkers);
+	num_bytes = add_size(num_bytes,
+						 sizeof(SpockExceptionLog) * nworkers);
 
 	spock_stats_max_entries = SPOCK_STATS_MAX_ENTRIES(nworkers);
 
@@ -679,9 +718,6 @@ worker_shmem_size(int nworkers, bool include_hash)
 		num_bytes = add_size(num_bytes,
 							 hash_estimate_size(spock_stats_max_entries,
 												sizeof(spockStatsEntry)));
-		num_bytes = add_size(num_bytes,
-							 hash_estimate_size(max_replication_slots,
-												sizeof(LagTrackerEntry)));
 	}
 
 	return num_bytes;
@@ -703,8 +739,8 @@ spock_worker_shmem_request(void)
 #endif
 
 	/*
-	 * This is cludge for Windows (Postgres des not define the GUC variable
-	 * as PGDDLIMPORT)
+	 * This is cludge for Windows (Postgres des not define the GUC variable as
+	 * PGDDLIMPORT)
 	 */
 	nworkers = atoi(GetConfigOptionByName("max_worker_processes", NULL,
 										  false));
@@ -722,7 +758,7 @@ spock_worker_shmem_request(void)
 static void
 spock_worker_shmem_startup(void)
 {
-	bool        found;
+	bool		found;
 	int			nworkers;
 	HASHCTL		hctl;
 
@@ -736,26 +772,30 @@ spock_worker_shmem_startup(void)
 	nworkers = atoi(GetConfigOptionByName("max_worker_processes", NULL,
 										  false));
 	SpockCtx = NULL;
-	 /* avoid possible race-conditions, when initializing the shared memory. */
+	/* avoid possible race-conditions, when initializing the shared memory. */
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
 	/* Init signaling context for the various processes. */
 	SpockCtx = ShmemInitStruct("spock_context",
 							   worker_shmem_size(nworkers, false), &found);
 
+
 	if (!found)
 	{
 		SpockCtx->lock = &((GetNamedLWLockTranche("spock")[0]).lock);
 		SpockCtx->lag_lock = &((GetNamedLWLockTranche("spock")[1]).lock);
-		SpockCtx->ctt_last_prune = GetCurrentTimestamp();
-		SpockCtx->ctt_prune_interval = spock_ctt_prune_interval;
 		SpockCtx->supervisor = NULL;
 		SpockCtx->subscriptions_changed = false;
 		SpockCtx->total_workers = nworkers;
-		SpockCtx->cluster_is_readonly = false;
 		memset(SpockCtx->workers, 0,
 			   sizeof(SpockWorker) * SpockCtx->total_workers);
 	}
+
+	exception_log_ptr = ShmemInitStruct("spock_exception_log_ptr",
+									worker_shmem_size(nworkers, false), &found);
+
+	if (!found)
+		memset(exception_log_ptr, 0, sizeof(SpockExceptionLog) * nworkers);
 
 	memset(&hctl, 0, sizeof(hctl));
 	hctl.keysize = sizeof(spockStatsKey);
@@ -766,15 +806,6 @@ spock_worker_shmem_startup(void)
 							  spock_stats_max_entries,
 							  &hctl,
 							  HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-
-	memset(&hctl, 0, sizeof(hctl));
-	hctl.keysize = NAMEDATALEN;
-	hctl.entrysize = sizeof(LagTrackerEntry);
-	LagTrackerHash = ShmemInitHash("spock lag tracker hash",
-									  max_replication_slots,
-									  max_replication_slots,
-									  &hctl,
-									  HASH_ELEM | HASH_STRINGS);
 
 	LWLockRelease(AddinShmemInitLock);
 }
@@ -821,18 +852,24 @@ spock_worker_type_name(SpockWorkerType type)
 {
 	switch (type)
 	{
-		case SPOCK_WORKER_NONE: return "none";
-		case SPOCK_WORKER_MANAGER: return "manager";
-		case SPOCK_WORKER_APPLY: return "apply";
-		case SPOCK_WORKER_SYNC: return "sync";
-		default: Assert(false); return NULL;
+		case SPOCK_WORKER_NONE:
+			return "none";
+		case SPOCK_WORKER_MANAGER:
+			return "manager";
+		case SPOCK_WORKER_APPLY:
+			return "apply";
+		case SPOCK_WORKER_SYNC:
+			return "sync";
+		default:
+			Assert(false);
+			return NULL;
 	}
 }
 
 void
 handle_stats_counter(Relation relation, Oid subid, spockStatsType typ, int ntup)
 {
-	bool found = false;
+	bool		found = false;
 	spockStatsKey key;
 	spockStatsEntry *entry;
 
@@ -845,8 +882,8 @@ handle_stats_counter(Relation relation, Oid subid, spockStatsType typ, int ntup)
 	key.relid = RelationGetRelid(relation);
 
 	/*
-	 * We first try to find an existing entry while holding the
-	 * SpockCtx lock in shared mode.
+	 * We first try to find an existing entry while holding the SpockCtx lock
+	 * in shared mode.
 	 */
 	LWLockAcquire(SpockCtx->lock, LW_SHARED);
 
@@ -855,17 +892,16 @@ handle_stats_counter(Relation relation, Oid subid, spockStatsType typ, int ntup)
 	if (!found)
 	{
 		/*
-		 * Didn't find this entry. Check that we didn't exceed the
-		 * hash table previously.
+		 * Didn't find this entry. Check that we didn't exceed the hash table
+		 * previously.
 		 */
 		LWLockRelease(SpockCtx->lock);
 		if (spock_stats_hash_full)
 			return;
 
 		/*
-		 * Upgrade to exclusive lock since we attempt to create a
-		 * new entry in the hash table. Then check for overflow
-		 * again.
+		 * Upgrade to exclusive lock since we attempt to create a new entry in
+		 * the hash table. Then check for overflow again.
 		 */
 		LWLockAcquire(SpockCtx->lock, LW_EXCLUSIVE);
 		if (hash_get_num_entries(SpockHash) >= spock_stats_max_entries)
@@ -892,25 +928,4 @@ handle_stats_counter(Relation relation, Oid subid, spockStatsType typ, int ntup)
 	SpinLockRelease(&entry->mutex);
 
 	LWLockRelease(SpockCtx->lock);
-}
-
-LagTrackerEntry *
-lag_tracker_entry(char *slotname, XLogRecPtr lsn, TimestampTz ts)
-{
-	LagTrackerEntry *hentry;
-	bool found;
-
-	Assert(LagTrackerHash != NULL);
-	LWLockAcquire(SpockCtx->lag_lock, LW_EXCLUSIVE);
-
-	/* Find lag info, creating if not found */
-	hentry = (LagTrackerEntry *) hash_search(LagTrackerHash,
-										 slotname,
-										 HASH_ENTER, &found);
-	Assert(hentry != NULL);
-	hentry->commit_sample.lsn = lsn;
-	hentry->commit_sample.time = ts;
-
-	LWLockRelease(SpockCtx->lag_lock);
-	return hentry;
 }

@@ -3,7 +3,7 @@
  * spock_proto_native.c
  * 		spock binary protocol functions
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -16,7 +16,9 @@
 #include "catalog/pg_type.h"
 #include "libpq/pqformat.h"
 #include "nodes/parsenodes.h"
+#include "replication/origin.h"
 #include "replication/reorderbuffer.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -38,6 +40,8 @@ static char decide_datum_transfer(Form_pg_attribute att,
 								  bool allow_binary_basetypes);
 
 static void spock_read_attrs(StringInfo in, char ***attrnames,
+								  Oid **attrtypes,
+								  Oid **attrtypmods,
 								  int *nattrnames);
 static void spock_read_tuple(StringInfo in, SpockRelation *rel,
 					  SpockTupleData *tuple);
@@ -148,6 +152,8 @@ spock_write_attrs(StringInfo out, Relation rel, Bitmapset *att_list)
 		len = strlen(attname) + 1;
 		pq_sendint(out, len, 2);
 		pq_sendbytes(out, attname, len); /* data */
+		pq_sendint32(out, att->atttypid);	/* atttype */
+		pq_sendint32(out, att->atttypmod);	/* atttypmod */
 	}
 
 	bms_free(idattrs);
@@ -199,32 +205,49 @@ spock_write_commit(StringInfo out, SpockOutputData *data,
 #else
 	pq_sendint64(out, txn->commit_time);
 #endif
+
+	/* send latest WAL insert pointer */
+	pq_sendint64(out, GetXLogInsertRecPtr());
 }
 
 /*
  * Write ORIGIN to the output stream.
  */
 void
-spock_write_origin(StringInfo out, const char *origin,
-						XLogRecPtr origin_lsn)
+spock_write_origin(StringInfo out, const RepOriginId origin_id,
+				   XLogRecPtr origin_lsn)
 {
 	uint8	flags = 0;
-	uint8	len;
 
-	Assert(strlen(origin) < 255);
+	Assert(origin_id != InvalidRepOriginId);
 
 	pq_sendbyte(out, 'O');		/* ORIGIN */
 
 	/* send the flags field its self */
 	pq_sendbyte(out, flags);
 
-	/* fixed fields */
+	/* send fields */
 	pq_sendint64(out, origin_lsn);
+	pq_sendint(out, origin_id, sizeof(RepOriginId));
+}
 
-	/* origin */
-	len = strlen(origin) + 1;
-	pq_sendbyte(out, len);
-	pq_sendbytes(out, origin, len);
+/*
+ * Write last commit ts for last process committed transaction
+ * for the slot group.
+ */
+void
+spock_write_commit_order(StringInfo out,
+						TimestampTz last_commit_ts)
+{
+	uint8	flags = 0;
+
+	pq_sendbyte(out, 'L');		/* last commit ts */
+
+	/* send the flags field its self */
+	pq_sendbyte(out, flags);
+
+	/* send timestamp */
+	pq_sendint64(out, last_commit_ts);
 }
 
 /*
@@ -497,6 +520,23 @@ spock_write_tuple(StringInfo out, SpockOutputData *data,
 	}
 }
 
+void
+spock_write_message(StringInfo out, TransactionId xid, XLogRecPtr lsn,
+					bool transactional, const char *prefix, Size sz,
+					const char *message)
+{
+	pq_sendbyte(out, 'M'); /* message type field */
+
+	/* send out message contents */
+	pq_sendint32(out, xid);
+	pq_sendint64(out, lsn);
+
+	pq_sendbyte(out, transactional);
+	pq_sendstring(out, prefix);
+	pq_sendint32(out, sz);
+	pq_sendbytes(out, message, sz);
+}
+
 /*
  * Make the executive decision about which protocol to use.
  */
@@ -542,7 +582,8 @@ decide_datum_transfer(Form_pg_attribute att, Form_pg_type typclass,
  */
 void
 spock_read_begin(StringInfo in, XLogRecPtr *remote_lsn,
-					  TimestampTz *committime, TransactionId *remote_xid)
+					  TimestampTz *committime,
+					  TransactionId *remote_xid)
 {
 	/* read flags */
 	uint8	flags = pq_getmsgbyte(in);
@@ -560,8 +601,11 @@ spock_read_begin(StringInfo in, XLogRecPtr *remote_lsn,
  * Read transaction COMMIT from the stream.
  */
 void
-spock_read_commit(StringInfo in, XLogRecPtr *commit_lsn,
-					   XLogRecPtr *end_lsn, TimestampTz *committime)
+spock_read_commit(StringInfo in,
+				  XLogRecPtr *commit_lsn,
+				  XLogRecPtr *end_lsn,
+				  TimestampTz *committime,
+				  XLogRecPtr *remote_insert_lsn)
 {
 	/* read flags */
 	uint8	flags = pq_getmsgbyte(in);
@@ -572,30 +616,43 @@ spock_read_commit(StringInfo in, XLogRecPtr *commit_lsn,
 	*commit_lsn = pq_getmsgint64(in);
 	*end_lsn = pq_getmsgint64(in);
 	*committime = pq_getmsgint64(in);
+	*remote_insert_lsn = pq_getmsgint64(in);
 }
 
 /*
  * Read ORIGIN from the output stream.
  */
-char *
+RepOriginId
 spock_read_origin(StringInfo in, XLogRecPtr *origin_lsn)
 {
 	uint8	flags;
-	uint8	len;
 
 	/* read the flags */
 	flags = pq_getmsgbyte(in);
 	Assert(flags == 0);
 	(void) flags; /* unused */
 
-	/* fixed fields */
+	/* read fields */
 	*origin_lsn = pq_getmsgint64(in);
-
-	/* origin */
-	len = pq_getmsgbyte(in);
-	return pnstrdup(pq_getmsgbytes(in, len), len);
+	return pq_getmsgint(in, sizeof(RepOriginId));
 }
 
+/*
+ * Read LAST commit ts info from the output stream.
+ */
+TimestampTz
+spock_read_commit_order(StringInfo in)
+{
+	uint8	flags;
+
+	/* read the flags */
+	flags = pq_getmsgbyte(in);
+	Assert(flags == 0);
+	(void) flags; /* unused */
+
+	/* read fields */
+	return pq_getmsgint64(in);
+}
 
 /*
  * Read INSERT from stream.
@@ -737,7 +794,7 @@ spock_read_tuple(StringInfo in, SpockRelation *rel,
 
 	natts = pq_getmsgint(in, 2);
 	if (rel->natts != natts)
-		elog(ERROR, "tuple natts mismatch between remote relation metadata cache (natts=%u) and remote tuple data (natts=%u)", rel->natts, natts);
+		elog(ERROR, "tuple natts mismatch for relation (%s) between remote relation metadata cache (natts=%u) and remote tuple data (natts=%u)", rel->relname, rel->natts, natts);
 
 	desc = RelationGetDescr(rel->rel);
 
@@ -745,6 +802,8 @@ spock_read_tuple(StringInfo in, SpockRelation *rel,
 	for (i = 0; i < natts; i++)
 	{
 		int			attid = rel->attmap[i];
+		Oid			attrtype = rel->attrtypes[i];
+		Oid			attrtypmod = rel->attrtypmods[i];
 		Form_pg_attribute att = TupleDescAttr(desc,attid);
 		char		kind = pq_getmsgbyte(in);
 		const char *data;
@@ -784,15 +843,35 @@ spock_read_tuple(StringInfo in, SpockRelation *rel,
 
 					len = pq_getmsgint(in, 4); /* read length */
 
-					if (att->attbyval && att->attlen > 0 && len != att->attlen)
+					/*
+					 * From a security standpoint, it doesn't matter whether the input's
+					 * column type matches what we expect: the column type's receive
+					 * function has to be robust enough to cope with invalid data.
+					 * However, from a user-friendliness standpoint, it's nicer to
+					 * complain about type mismatches than to throw "improper binary
+					 * format" errors.  But there's a problem: only built-in types have
+					 * OIDs that are stable enough to believe that a mismatch is a real
+					 * issue.  So complain only if both OIDs are in the built-in range.
+					 * Otherwise, carry on with the column type we "should" be getting.
+					 */
+					if ((att->atttypid != attrtype ||
+						 att->atttypmod != attrtypmod) &&
+						att->atttypid < FirstNormalObjectId &&
+						attrtype < FirstNormalObjectId)
+					{
+						bits16		flags = FORMAT_TYPE_TYPEMOD_GIVEN | FORMAT_TYPE_ALLOW_INVALID;
+
 						ereport(ERROR,
-								(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
-								 errmsg("binary data length mismatch"),
-								 errdetail("attribute %s of table %s expects "
-								 		   "%d bytes but %d bytes received",
+								(errcode(ERRCODE_DATATYPE_MISMATCH),
+								 errmsg("binary data has type %u (%s) instead of expected %u (%s)",
+										attrtype,
+										format_type_extended(attrtype, attrtypmod, flags),
+										att->atttypid,
+										format_type_extended(att->atttypid, att->atttypmod, flags)),
+								 errdetail("check attribute '%s' of table '%s'",
 										   NameStr(att->attname),
-										   NameStr(rel->rel->rd_rel->relname),
-										   att->attlen, len)));
+										   NameStr(rel->rel->rd_rel->relname))));
+					}
 
 					getTypeBinaryInputInfo(att->atttypid,
 										   &typreceive, &typioparam);
@@ -808,7 +887,9 @@ spock_read_tuple(StringInfo in, SpockRelation *rel,
 					if (buf.len != buf.cursor)
 						ereport(ERROR,
 								(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
-								 errmsg("incorrect binary data format")));
+								 errmsg("incorrect binary data format for column '%s' of table '%s'",
+										NameStr(att->attname),
+										NameStr(rel->rel->rd_rel->relname))));
 					break;
 				}
 			case 't': /* text format */
@@ -848,6 +929,8 @@ spock_read_rel(StringInfo in)
 	char	   *relname;
 	int			natts;
 	char	  **attrnames;
+	Oid		   *attrtypes;
+	Oid		   *attrtypmods;
 
 	/* read the flags */
 	flags = pq_getmsgbyte(in);
@@ -864,9 +947,9 @@ spock_read_rel(StringInfo in)
 	relname = (char *) pq_getmsgbytes(in, len);
 
 	/* Get attribute description */
-	spock_read_attrs(in, &attrnames, &natts);
+	spock_read_attrs(in, &attrnames, &attrtypes, &attrtypmods, &natts);
 
-	spock_relation_cache_update(relid, schemaname, relname, natts, attrnames);
+	spock_relation_cache_update(relid, schemaname, relname, natts, attrnames, attrtypes, attrtypmods);
 
 	return relid;
 }
@@ -877,11 +960,14 @@ spock_read_rel(StringInfo in)
  * TODO handle flags.
  */
 static void
-spock_read_attrs(StringInfo in, char ***attrnames, int *nattrnames)
+spock_read_attrs(StringInfo in, char ***attrnames, Oid **attrtypes,
+				 Oid **attrtypmods, int *nattrnames)
 {
 	int			i;
 	uint16		nattrs;
 	char	  **attrs;
+	Oid		   *types;
+	Oid		   *typmods;
 	char		blocktype;
 
 	blocktype = pq_getmsgbyte(in);
@@ -890,6 +976,8 @@ spock_read_attrs(StringInfo in, char ***attrnames, int *nattrnames)
 
 	nattrs = pq_getmsgint(in, 2);
 	attrs = palloc(nattrs * sizeof(char *));
+	types = (Oid *) palloc(nattrs * sizeof(Oid));
+	typmods = (Oid *) palloc(nattrs * sizeof(Oid));
 
 	/* read the attributes */
 	for (i = 0; i < nattrs; i++)
@@ -910,8 +998,61 @@ spock_read_attrs(StringInfo in, char ***attrnames, int *nattrnames)
 		len = pq_getmsgint(in, 2);
 		/* the string is NULL terminated */
 		attrs[i] = (char *) pq_getmsgbytes(in, len);
+		types[i] = pq_getmsgint(in, 4);		/* atttype */
+		typmods[i] = pq_getmsgint(in, 4);	/* atttypmod */
 	}
 
 	*attrnames = attrs;
+	*attrtypes = types;
+	*attrtypmods = typmods;
 	*nattrnames = nattrs;
+}
+
+/*
+ * Write TRUNCATE command to the outputstream.
+ */
+void
+spock_write_truncate(StringInfo out, int nrelids, Oid relids[], bool cascade,
+					 bool restart_seqs)
+{
+	int			i;
+	uint8		flags = 0;
+
+	pq_sendbyte(out, 'T');
+
+	pq_sendint32(out, nrelids);
+
+	/* encode and send truncate flags */
+	if (cascade)
+		flags |= TRUNCATE_CASCADE;
+	if (restart_seqs)
+		flags |= TRUNCATE_RESTART_SEQS;
+	pq_sendint8(out, flags);
+
+	for (i = 0; i < nrelids; i++)
+		pq_sendint32(out, relids[i]);
+}
+
+/*
+ * Read TRUNCATE command from the outputstream.
+ */
+List *
+spock_read_truncate(StringInfo in, bool *cascade, bool *restart_seqs)
+{
+	int			i;
+	int			nrelids;
+	List	   *relids = NIL;
+	uint8		flags;
+
+	nrelids = pq_getmsgint(in, 4);
+
+	/* read and decode truncate flags */
+	flags = pq_getmsgint(in, 1);
+	*cascade = (flags & TRUNCATE_CASCADE) > 0;
+	*restart_seqs = (flags & TRUNCATE_RESTART_SEQS) > 0;
+
+	for (i = 0; i < nrelids; i++)
+		relids = lappend_oid(relids, pq_getmsgint(in, 4));
+
+	return relids;
 }

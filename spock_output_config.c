@@ -3,7 +3,7 @@
  * spock_output_config.c
  *		  Logical Replication output plugin configuration handling
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -74,7 +74,8 @@ enum {
 	PARAM_NO_TXINFO
 } OutputPluginParamKey;
 
-typedef struct {
+typedef struct OutputPluginParam
+{
 	const char * const paramname;
 	int paramkey;
 } OutputPluginParam;
@@ -480,19 +481,19 @@ parse_param_int32(DefElem *elem)
 static List*
 add_startup_msg_s(List *l, char *key, char *val)
 {
-	return lappend(l, makeDefElem(key, (Node*)makeString(val)));
+	return lappend(l, makeDefElem(key, (Node*)makeString(val), -1));
 }
 
 static List*
 add_startup_msg_i(List *l, char *key, int val)
 {
-	return lappend(l, makeDefElem(key, (Node*)makeString(psprintf("%d", val))));
+	return lappend(l, makeDefElem(key, (Node*)makeString(psprintf("%d", val)), -1));
 }
 
 static List*
 add_startup_msg_b(List *l, char *key, bool val)
 {
-	return lappend(l, makeDefElem(key, (Node*)makeString(val ? "t" : "f")));
+	return lappend(l, makeDefElem(key, (Node*)makeString(val ? "t" : "f"), -1));
 }
 
 /*
@@ -518,8 +519,8 @@ prepare_startup_message(SpockOutputData *data)
 {
 	List *l = NIL;
 
-	l = add_startup_msg_s(l, "max_proto_version", "1");
-	l = add_startup_msg_s(l, "min_proto_version", "1");
+	l = add_startup_msg_i(l, "max_proto_version", SPOCK_PROTO_VERSION_NUM);
+	l = add_startup_msg_i(l, "min_proto_version", SPOCK_PROTO_MIN_VERSION_NUM);
 
 	/* We don't support understand column types yet */
 	l = add_startup_msg_b(l, "coltypes", false);

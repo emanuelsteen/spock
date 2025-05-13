@@ -3,7 +3,7 @@
  * spock_repset.c
  *		spock replication set manipulation functions
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -409,6 +409,7 @@ get_table_replication_info(Oid nodeid, Relation table,
 	entry->replicate_insert = false;
 	entry->replicate_update = false;
 	entry->replicate_delete = false;
+	entry->replicate_truncate = false;
 	entry->att_list = NULL;
 	entry->row_filter = NIL;
 
@@ -466,6 +467,8 @@ get_table_replication_info(Oid nodeid, Relation table,
 					entry->replicate_update = true;
 				if (repset->replicate_delete)
 					entry->replicate_delete = true;
+				if (repset->replicate_truncate)
+					entry->replicate_truncate = true;
 
 				/* Update replicated column map. */
 				d = heap_getattr(tuple, Anum_repset_table_att_list,
@@ -1111,8 +1114,6 @@ replication_set_add_table(Oid setid, Oid reloid, List *att_list,
 						   "replication set is configured to replicate "
 						   "UPDATEs and/or DELETEs"),
 				 errhint("Add a PRIMARY KEY to the table")));
-
-	create_truncate_trigger(targetrel);
 
 	table_close(targetrel, NoLock);
 

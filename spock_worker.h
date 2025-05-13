@@ -3,7 +3,7 @@
  * spock_worker.h
  *              spock worker helper functions
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -15,7 +15,9 @@
 #include "storage/lock.h"
 
 #include "spock.h"
+#include "spock_apply.h"			/* for SpockApplyGroupData */
 #include "spock_output_plugin.h"	/* for SpockOutputSlotGroup */
+#include "spock_proto_native.h"
 
 typedef enum {
 	SPOCK_WORKER_NONE,		/* Unused slot. */
@@ -25,13 +27,36 @@ typedef enum {
 								 * one table. */
 } SpockWorkerType;
 
+/*
+ * Apply workers shared memory information per database per origin
+ *
+ * We want to be able to cleanup on proc exit. However, since MyProc may be
+ * NULL during exit, we'd be using group_has_workers atomic variable when
+ * decrement attached count, whereas when creating an entry to incrementing,
+ * we must protect it with an LWLock to avoid race conditions..
+ *
+ * This strategy avoids using LWLocks for cleanup.
+ */
+typedef struct SpockApplyGroupData
+{
+	Oid dbid;
+	RepOriginId replorigin;
+	pg_atomic_uint32 nattached;
+	TimestampTz prev_remote_ts;
+	XLogRecPtr remote_lsn;
+	XLogRecPtr remote_insert_lsn;
+	ConditionVariable prev_processed_cv;
+} SpockApplyGroupData;
+
+typedef SpockApplyGroupData *SpockApplyGroup;
+
 typedef struct SpockApplyWorker
 {
 	Oid			subid;				/* Subscription id for apply worker. */
-	bool		sync_pending;		/* Is there new synchronization info pending?. */
 	XLogRecPtr	replay_stop_lsn;	/* Replay should stop here if defined. */
-	RepOriginId	replorigin;			/* Remote origin id of apply worker. */
-	TimestampTz	last_ts;			/* Last remote commit timestamp. */
+	bool		sync_pending;		/* Is there new synchronization info pending?. */
+	bool		use_try_block;		/* Should use try block for apply? */
+	SpockApplyGroup apply_group;	/* Apply group to be used with parallel slots. */
 } SpockApplyWorker;
 
 typedef struct SpockSyncWorker
@@ -51,10 +76,16 @@ typedef struct SpockWorker {
 	PGPROC *proc;
 
 	/* Time at which worker crashed (normally 0). */
-	TimestampTz	crashed_at;
+	TimestampTz	terminated_at;
+
+	/* Interval for restart delay in ms */
+	int restart_delay;
 
 	/* Database id to connect to. */
 	Oid		dboid;
+
+	/* WAL Insert location on origin */
+	XLogRecPtr	remote_wal_insert_lsn;
 
 	/* Type-specific worker info */
 	union
@@ -72,28 +103,27 @@ typedef struct SpockContext {
 	/* Access lock for Lag Tracking Hash. */
 	LWLock	   *lag_lock;
 
-	/* Interval for pruning the conflict_tracker table */
-	int		ctt_prune_interval;
-	Datum	ctt_last_prune;
-
 	/* Supervisor process. */
 	PGPROC	   *supervisor;
 
 	/* Signal that subscription info have changed. */
 	bool		subscriptions_changed;
 
-	/* cluster read-only global flag */
-	bool		cluster_is_readonly;
-
 	/* Spock slot-group data */
 	LWLock				   *slot_group_master_lock;
 	int						slot_ngroups;
 	SpockOutputSlotGroup   *slot_groups;
 
+	/* Spock apply db-origin data */
+	LWLock				   *apply_group_master_lock;
+	int						napply_groups;
+	SpockApplyGroupData	   *apply_groups;
+
 	/* Background workers. */
 	int			total_workers;
 	SpockWorker  workers[FLEXIBLE_ARRAY_MEMBER];
 } SpockContext;
+
 
 typedef enum spockStatsType
 {
@@ -122,21 +152,6 @@ typedef struct spockStatsEntry
 	slock_t			mutex;
 } spockStatsEntry;
 
-/* A sample associating a WAL location with the time it was written. */
-typedef struct
-{
-	XLogRecPtr		lsn;
-	TimestampTz		time;
-} WalTimeSample;
-
-typedef struct LagTrackerEntry
-{
-	char			slotname[NAMEDATALEN];
-	WalTimeSample	commit_sample;
-
-} LagTrackerEntry;
-
-extern HTAB				   *LagTrackerHash;
 extern HTAB				   *SpockHash;
 extern SpockContext		   *SpockCtx;
 extern SpockWorker		   *MySpockWorker;
@@ -171,12 +186,11 @@ extern List *spock_sync_find_all(Oid dboid, Oid subscriberid);
 
 extern SpockWorker *spock_get_worker(int slot);
 extern bool spock_worker_running(SpockWorker *w);
+extern bool spock_worker_terminating(SpockWorker *w);
 extern void spock_worker_kill(SpockWorker *worker);
 
 extern const char * spock_worker_type_name(SpockWorkerType type);
 extern void handle_stats_counter(Relation relation, Oid subid,
 								spockStatsType typ, int ntup);
-
-extern LagTrackerEntry *lag_tracker_entry(char *slotname, XLogRecPtr lsn, TimestampTz ts);
 
 #endif /* SPOCK_WORKER_H */

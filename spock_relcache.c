@@ -3,7 +3,7 @@
  * spock_relcache.c
  *     Caching relation specific information
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -12,17 +12,19 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "access/reloptions.h"
 
+#include "catalog/namespace.h"
 #include "catalog/pg_trigger.h"
 
-#include "commands/trigger.h"
-
+#include "utils/attoptcache.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
 #include "utils/hsearch.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/rel.h"
+#include "spock_common.h"
 
 #include "spock.h"
 #include "spock_relcache.h"
@@ -52,10 +54,13 @@ relcache_free_entry(SpockRelation *entry)
 
 	if (entry->attmap)
 		pfree(entry->attmap);
+	if (entry->delta_apply_functions)
+		pfree(entry->delta_apply_functions);
 
 	entry->natts = 0;
 	entry->reloid = InvalidOid;
 	entry->rel = NULL;
+	entry->has_delta_columns = false;
 }
 
 
@@ -79,9 +84,10 @@ spock_relation_open(uint32 remoteid, LOCKMODE lockmode)
 	/* Need to update the local cache? */
 	if (!OidIsValid(entry->reloid))
 	{
-		RangeVar   *rv = makeNode(RangeVar);
-		int			i;
-		TupleDesc	desc;
+		RangeVar	   *rv = makeNode(RangeVar);
+		int				i;
+		TupleDesc		desc;
+		ResultRelInfo  *relinfo;
 
 		rv->schemaname = (char *) entry->nspname;
 		rv->relname = (char *) entry->relname;
@@ -89,9 +95,45 @@ spock_relation_open(uint32 remoteid, LOCKMODE lockmode)
 
 		desc = RelationGetDescr(entry->rel);
 		for (i = 0; i < entry->natts; i++)
-			entry->attmap[i] = tupdesc_get_att_by_name(desc, entry->attnames[i]);
+		{
+			AttributeOpts  *aopt;
 
+			entry->attmap[i] = tupdesc_get_att_by_name(desc, entry->attnames[i]);
+			/*
+			 * If we find attribute options for this column and the
+			 * delta_apply_function is set, lookup the oid for it.
+			 */
+			aopt = get_attribute_options(entry->rel->rd_id,
+										 entry->attmap[i] + 1);
+			if (aopt != NULL && aopt->delta_apply_function != 0)
+			{
+				char			   *fname;
+				Form_pg_attribute	att;
+				Oid					dfunc;
+
+				att = TupleDescAttr(desc, entry->attmap[i]);
+				fname = pstrdup(GET_STRING_RELOPTION(aopt,
+													 delta_apply_function));
+				dfunc = spock_lookup_delta_function(fname, att->atttypid);
+				pfree(fname);
+
+				if (dfunc == InvalidOid)
+					elog(ERROR, "SPOCK: column %s.%s.%s is configured for "
+						 "delta_apply_function %s - function not found",
+						 entry->nspname, entry->relname,
+						 entry->attnames[i],
+						 GET_STRING_RELOPTION(aopt, delta_apply_function));
+
+
+				entry->has_delta_columns = true;
+				entry->delta_apply_functions[entry->attmap[i]] = dfunc;
+			}
+		}
+
+		relinfo = makeNode(ResultRelInfo);
+		InitResultRelInfo(relinfo, entry->rel, 1, NULL, 0);
 		entry->reloid = RelationGetRelid(entry->rel);
+		entry->idxoid = RelationGetReplicaIndex(relinfo->ri_RelationDesc);
 
 		/* Cache trigger info. */
 		entry->hasTriggers = false;
@@ -122,10 +164,11 @@ spock_relation_open(uint32 remoteid, LOCKMODE lockmode)
 
 void
 spock_relation_cache_update(uint32 remoteid, char *schemaname,
-								 char *relname, int natts, char **attnames)
+								 char *relname, int natts, char **attnames,
+								 Oid *attrtypes, Oid *attrtypmods)
 {
 	MemoryContext		oldcontext;
-	SpockRelation  *entry;
+	SpockRelation	   *entry;
 	bool				found;
 	int					i;
 
@@ -147,9 +190,17 @@ spock_relation_cache_update(uint32 remoteid, char *schemaname,
 	entry->relname = pstrdup(relname);
 	entry->natts = natts;
 	entry->attnames = palloc(natts * sizeof(char *));
+	entry->attrtypes = (Oid *) palloc(natts * sizeof(Oid));
+	entry->attrtypmods = (Oid *) palloc(natts * sizeof(Oid));
 	for (i = 0; i < natts; i++)
+	{
 		entry->attnames[i] = pstrdup(attnames[i]);
+		entry->attrtypes[i] = attrtypes[i];
+		entry->attrtypmods[i] = attrtypmods[i];
+	}
 	entry->attmap = palloc(natts * sizeof(int));
+	entry->has_delta_columns = false;
+	entry->delta_apply_functions = palloc0(natts * sizeof(Oid));
 	MemoryContextSwitchTo(oldcontext);
 
 	/* XXX Should we validate the relation against local schema here? */
@@ -186,6 +237,8 @@ spock_relation_cache_updater(SpockRemoteRel *remoterel)
 	for (i = 0; i < remoterel->natts; i++)
 		entry->attnames[i] = pstrdup(remoterel->attnames[i]);
 	entry->attmap = palloc(remoterel->natts * sizeof(int));
+	entry->has_delta_columns = false;
+	entry->delta_apply_functions = palloc0(remoterel->natts * sizeof(Oid));
 	MemoryContextSwitchTo(oldcontext);
 
 	/* XXX Should we validate the relation against local schema here? */
@@ -279,4 +332,48 @@ tupdesc_get_att_by_name(TupleDesc desc, const char *attname)
 	}
 
 	elog(ERROR, "unknown column name %s", attname);
+}
+
+
+/*
+ * Find a delta apply function (either custom or built in) by
+ * the signature fname(typeoid, typeoid, typeoid).
+ */
+Oid
+spock_lookup_delta_function(char *fname, Oid typeoid)
+{
+	List			   *namelist;
+	List			   *namestrings = NIL;
+	ListCell		   *l;
+	FuncCandidateList	candidates;
+	FuncCandidateList	fc;
+	Oid					funcoid = InvalidOid;
+
+	/* Split the function name into [schema.][funcname] */
+	if (!SplitIdentifierString(fname, '.', &namelist))
+		elog(ERROR, "Invalid delta apply function name \"%s\"", fname);
+	if (namelist == NIL)
+		elog(ERROR, "Invalid delta apply function name \"%s\"", fname);
+
+	/* Convert that into strings usable by FuncnameGetCandidates() */
+	foreach(l, namelist)
+	{
+		char   *n = (char *)lfirst(l);
+
+		namestrings = lappend(namestrings, makeString(pstrdup(n)));
+	}
+
+	/* Find a match */
+	candidates = FuncnameGetCandidates(namestrings, 3, NIL,
+									   false, false, false, false);
+	for (fc = candidates; fc != NULL; fc = fc->next)
+		if (fc->args[0] == typeoid &&
+			fc->args[1] == typeoid &&
+			fc->args[2] == typeoid)
+			break;
+
+	if (fc != NULL && OidIsValid(fc->oid))
+		funcoid = fc->oid;
+
+	return funcoid;
 }

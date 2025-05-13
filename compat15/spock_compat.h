@@ -41,6 +41,12 @@
 #define PortalRun(portal, count, isTopLevel, dest, altdest, qc) \
 	PortalRun(portal, count, isTopLevel, true, dest, altdest, qc)
 
+#define ExecInitRangeTable(estate, rangeTable, perminfos) \
+	ExecInitRangeTable(estate, rangeTable)
+
+#define EvalPlanQualInit(epqstate, parentstate, subplan, auxrowmarks, epqParam, resultRelations) \
+	EvalPlanQualInitExt(epqstate, parentstate, subplan, auxrowmarks, epqParam, resultRelations)
+
 #define ExecAlterExtensionStmt(stmt) \
 	ExecAlterExtensionStmt(NULL, stmt)
 
@@ -56,9 +62,6 @@
 
 #define Form_pg_sequence Form_pg_sequence_data
 
-#define InitResultRelInfo(resultRelInfo, resultRelationDesc, resultRelationIndex, instrument_options) \
-	InitResultRelInfo(resultRelInfo, resultRelationDesc, resultRelationIndex, NULL, instrument_options)
-
 #define ExecARUpdateTriggers(estate, relinfo, tupleid, fdw_trigtuple, newslot, recheckIndexes) \
 	ExecARUpdateTriggers(estate, relinfo, NULL, NULL, tupleid, fdw_trigtuple, newslot, recheckIndexes, NULL, false)
 
@@ -67,8 +70,6 @@
 
 #define ExecARDeleteTriggers(estate, relinfo, tupleid, fdw_trigtuple) \
 	ExecARDeleteTriggers(estate, relinfo, tupleid, fdw_trigtuple, NULL, false)
-
-#define makeDefElem(name, arg) makeDefElem(name, arg, -1)
 
 #define SPKstandard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, sentToRemote, qc) \
 	standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc)
@@ -89,13 +90,6 @@
 
 #define SPKReplicationSlotCreate(name, db_specific, persistency) ReplicationSlotCreate(name, db_specific, persistency)
 
-#ifndef rbtxn_has_catalog_changes
-#define rbtxn_has_catalog_changes(txn) (txn->has_catalog_changes)
-#endif
-
-#define ExecInitExtraTupleSlot(estate) \
-	ExecInitExtraTupleSlot(estate, NULL, &TTSOpsHeapTuple)
-
 #define ACL_OBJECT_RELATION OBJECT_TABLE
 #define ACL_OBJECT_SEQUENCE OBJECT_SEQUENCE
 
@@ -108,7 +102,18 @@
 #define addRTEPermissionInfo(rteperminfos, rte) \
 	*rteperminfos = NIL;
 
-#define SwitchToUntrustedUser(userid, context) ((void)0)
-#define RestoreUserContext(context) ((void)0)
+#define SwitchToUntrustedUser(userid, context) \
+		SPKSwitchToUntrustedUser(userid, context)
+#define RestoreUserContext(context) \
+		SPKRestoreUserContext(context)
+
+/* Must use this interface for access HeapTuple in ReorderBufferChange */
+#define ReorderBufferChangeHeapTuple(change, tuple_type) \
+	&change->data.tp.tuple_type->tuple
+
+#define ExecuteTruncateGuts(explicit_rels, relids, relids_logged, behavior, \
+							restart_seqs, run_as_table_owner) \
+		ExecuteTruncateGuts(explicit_rels, relids, relids_logged, behavior, \
+							restart_seqs)
 
 #endif

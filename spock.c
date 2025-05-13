@@ -3,7 +3,7 @@
  * spock.c
  * 		spock initialization and common functionality
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -25,7 +25,6 @@
 #include "catalog/pg_type.h"
 
 #include "commands/extension.h"
-#include "commands/trigger.h"
 
 #include "executor/executor.h"
 
@@ -51,22 +50,30 @@
 
 #include "pgstat.h"
 
+#include "spock_apply.h"
 #include "spock_executor.h"
 #include "spock_node.h"
 #include "spock_conflict.h"
 #include "spock_worker.h"
 #include "spock_output_plugin.h"
+#include "spock_exception_handler.h"
+#include "spock_readonly.h"
 #include "spock.h"
 
 PG_MODULE_MAGIC;
 
 static const struct config_enum_entry SpockConflictResolvers[] = {
-	{"error", SPOCK_RESOLVE_ERROR, false},
 #ifndef XCP
+	/*
+	 * Disabled until we can clearly define their desired behavior.
+	 * Jan Wieck 2024-08-12
+	 *
+	{"error", SPOCK_RESOLVE_ERROR, false},
 	{"apply_remote", SPOCK_RESOLVE_APPLY_REMOTE, false},
 	{"keep_local", SPOCK_RESOLVE_KEEP_LOCAL, false},
-	{"last_update_wins", SPOCK_RESOLVE_LAST_UPDATE_WINS, false},
 	{"first_update_wins", SPOCK_RESOLVE_FIRST_UPDATE_WINS, false},
+	*/
+	{"last_update_wins", SPOCK_RESOLVE_LAST_UPDATE_WINS, false},
 #endif
 	{NULL, 0, false}
 };
@@ -89,15 +96,41 @@ static const struct config_enum_entry server_message_level_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry exception_behaviour_options[] = {
+	{"discard", DISCARD, false},
+	{"transdiscard", TRANSDISCARD, false},
+	{"sub_disable", SUB_DISABLE, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry exception_logging_options[] = {
+	{"none", LOG_NONE, false},
+	{"discard", LOG_DISCARD, false},
+	{"all", LOG_ALL, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry readonly_options[] = {
+	{"off", READONLY_OFF, false},
+	{"user", READONLY_USER, false},
+	{"all", READONLY_ALL, false},
+	{NULL, 0, false}
+};
+
 bool	spock_synchronous_commit = false;
 char   *spock_temp_directory = "";
 bool	spock_use_spi = false;
-int		spock_ctt_prune_interval;
 bool	spock_batch_inserts = true;
 static char *spock_temp_directory_config;
 bool	spock_ch_stats = true;
 static char *spock_country_code;
 bool	spock_deny_ddl = false;
+bool	spock_enable_ddl_replication = false;
+bool	spock_include_ddl_repset = false;
+bool	allow_ddl_from_functions = false;
+int		restart_delay_default;
+int		restart_delay_on_exception;
+
 
 void _PG_init(void);
 PGDLLEXPORT void spock_supervisor_main(Datum main_arg);
@@ -503,8 +536,8 @@ spock_start_replication(PGconn *streamConn, const char *slot_name,
 	/* Basic protocol info. */
 	appendStringInfo(&command, "expected_encoding '%s'",
 					 GetDatabaseEncodingName());
-	appendStringInfo(&command, ", min_proto_version '%d'", SPOCK_MIN_PROTO_VERSION_NUM);
-	appendStringInfo(&command, ", max_proto_version '%d'", SPOCK_MAX_PROTO_VERSION_NUM);
+	appendStringInfo(&command, ", min_proto_version '%d'", SPOCK_PROTO_MIN_VERSION_NUM);
+	appendStringInfo(&command, ", max_proto_version '%d'", SPOCK_PROTO_VERSION_NUM);
 	appendStringInfo(&command, ", startup_params_format '1'");
 
 	/* Binary protocol compatibility. */
@@ -755,6 +788,7 @@ spock_temp_directory_assing_hook(const char *newval, void *extra)
 				 errmsg("out of memory")));
 }
 
+
 /*
  * Entry point for this module.
  */
@@ -770,11 +804,7 @@ _PG_init(void)
 							 gettext_noop("Sets method used for conflict resolution for resolvable conflicts."),
 							 NULL,
 							 &spock_conflict_resolver,
-#ifdef XCP
-							 SPOCK_RESOLVE_ERROR,
-#else
-							 SPOCK_RESOLVE_APPLY_REMOTE,
-#endif
+							 SPOCK_RESOLVE_LAST_UPDATE_WINS,
 							 SpockConflictResolvers,
 							 PGC_SUSET, 0,
 							 spock_conflict_resolver_check_hook,
@@ -787,6 +817,24 @@ _PG_init(void)
 							 LOG,
 							 server_message_level_options,
 							 PGC_SUSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("spock.exception_behaviour",
+							 gettext_noop("Sets the behaviour on exception."),
+							 NULL,
+							 &exception_behaviour,
+							 TRANSDISCARD,
+							 exception_behaviour_options,
+							 PGC_SIGHUP, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("spock.exception_logging",
+							 gettext_noop("Sets what is logged on exception."),
+							 NULL,
+							 &exception_logging,
+							 LOG_ALL,
+							 exception_logging_options,
+							 PGC_SIGHUP, 0,
 							 NULL, NULL, NULL);
 
 	DefineCustomIntVariable("spock.stats_max_entries",
@@ -807,7 +855,7 @@ _PG_init(void)
 							 "Log conflict resolutions to spock."CATALOG_LOGTABLE" table.",
 							 NULL,
 							 &spock_save_resolutions,
-							 false, PGC_POSTMASTER,
+							 false, PGC_SIGHUP,
 							 0,
 							 NULL, NULL, NULL);
 
@@ -865,16 +913,6 @@ _PG_init(void)
 							   0,
 							   NULL, NULL, NULL);
 
-	DefineCustomIntVariable("spock.conflict_prune_interval",
-							   "Interval for pruning the conflict_tracker table",
-							   NULL,
-							   &spock_ctt_prune_interval,
-							   30,
-							   0, 3600,
-							   PGC_SIGHUP,
-							   GUC_UNIT_S,
-							   NULL, NULL, NULL);
-
 	DefineCustomBoolVariable("spock.channel_counters",
 							   "Enable spock statistics information collection",
 							   NULL,
@@ -903,6 +941,68 @@ _PG_init(void)
 							   0,
 							   NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("spock.enable_ddl_replication",
+							   "Replicate All DDL statements automatically",
+							   NULL,
+							   &spock_enable_ddl_replication,
+							   false,
+							   PGC_USERSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("spock.include_ddl_repset",
+							   "Add tables to the replication set while doing ddl replication",
+							   NULL,
+							   &spock_include_ddl_repset,
+							   false,
+							   PGC_USERSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("spock.allow_ddl_from_functions",
+							   "Allow replication of DDL statements from within functions",
+							   NULL,
+							   &allow_ddl_from_functions,
+							   false,
+							   PGC_USERSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomIntVariable("spock.restart_delay_default",
+							"Default apply-worker restart delay in ms",
+							NULL,
+							&restart_delay_default,
+							5000,
+							SPOCK_RESTART_MIN_DELAY,
+							INT_MAX,
+							PGC_POSTMASTER,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("spock.restart_delay_on_exception",
+							"apply-worker restart delay in ms on exception",
+							NULL,
+							&restart_delay_on_exception,
+							0,
+							0,
+							INT_MAX,
+							PGC_POSTMASTER,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomEnumVariable("spock.readonly",
+							 gettext_noop("Controls cluster read-only mode."),
+							 NULL,
+							 &spock_readonly,
+							 READONLY_OFF,
+							 readonly_options,
+							 PGC_SUSET, 0,
+							 NULL, NULL, NULL);
+
 	if (IsBinaryUpgrade)
 		return;
 
@@ -911,6 +1011,9 @@ _PG_init(void)
 
 	/* Init output plugin shmem */
 	spock_output_plugin_shmem_init();
+
+	/* Init output plugin shmem */
+	spock_apply_group_shmem_init();
 
 	/* Init executor module */
 	spock_executor_init();
@@ -930,5 +1033,5 @@ _PG_init(void)
 
 	RegisterBackgroundWorker(&bgw);
 
-    spock_init_failover_slot();
+	spock_init_failover_slot();
 }

@@ -3,7 +3,7 @@
  * spock_repset.h
  *		spock replication set manipulation functions
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -39,6 +39,7 @@ typedef struct SpockTableRepInfo
 	bool			replicate_insert;	/* should insert be replicated? */
 	bool			replicate_update;	/* should update be replicated? */
 	bool			replicate_delete;	/* should delete be replicated? */
+	bool			replicate_truncate;	/* should truncate be replicated? */
 
 	Bitmapset	   *att_list;			/* column filter
 										   NULL if everything is replicated

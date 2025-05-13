@@ -3,7 +3,7 @@
  * spock_executor.h
  *              spock replication plugin
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -20,7 +20,6 @@
 #endif
 #include "parser/parse_node.h"
 
-extern List *spock_truncated_tables;
 
 extern EState *create_estate_for_relation(Relation rel, bool forwrite);
 extern ExprContext *prepare_per_tuple_econtext(EState *estate, TupleDesc tupdesc);

@@ -3,7 +3,7 @@
  * spock_executor.c
  * 		spock executor related functions
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -19,14 +19,16 @@
 #include "access/xlog.h"
 
 #include "catalog/dependency.h"
+#include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_extension.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_type.h"
 
+#include "commands/defrem.h"
 #include "commands/extension.h"
-#include "commands/trigger.h"
 
 #include "executor/executor.h"
 
@@ -48,6 +50,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+#include "spock_common.h"
 #include "spock_node.h"
 #include "spock_executor.h"
 #include "spock_repset.h"
@@ -55,16 +58,18 @@
 #include "spock_dependency.h"
 #include "spock.h"
 
-List *spock_truncated_tables = NIL;
 
 static DropBehavior	spock_lastDropBehavior = DROP_RESTRICT;
 static bool			dropping_spock_obj = false;
 static object_access_hook_type next_object_access_hook = NULL;
 
 static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
-extern post_parse_analyze_hook_type prev_post_parse_analyze_hook;
-extern ExecutorStart_hook_type prev_executor_start_hook;
 
+static post_parse_analyze_hook_type prev_post_parse_analyze_hook;
+static ExecutorStart_hook_type prev_executor_start_hook;
+
+void spock_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate);
+void spock_ExecutorStart(QueryDesc *queryDesc, int eflags);
 
 EState *
 create_estate_for_relation(Relation rel, bool forwrite)
@@ -83,11 +88,7 @@ create_estate_for_relation(Relation rel, bool forwrite)
 	estate = CreateExecutorState();
 
 	addRTEPermissionInfo(&perminfos, rte);
-	ExecInitRangeTable(estate, list_make1(rte)
-#if PG_VERSION_NUM >= 160000
-		, perminfos
-#endif
-		);
+	ExecInitRangeTable(estate, list_make1(rte), perminfos);
 
 	estate->es_output_cid = GetCurrentCommandId(forwrite);
 
@@ -103,7 +104,8 @@ prepare_per_tuple_econtext(EState *estate, TupleDesc tupdesc)
 	econtext = GetPerTupleExprContext(estate);
 
 	oldContext = MemoryContextSwitchTo(estate->es_query_cxt);
-	econtext->ecxt_scantuple = ExecInitExtraTupleSlot(estate);
+	econtext->ecxt_scantuple = ExecInitExtraTupleSlot(estate, NULL, 
+													  &TTSOpsHeapTuple);
 	MemoryContextSwitchTo(oldContext);
 
 	ExecSetSlotDescriptor(econtext->ecxt_scantuple, tupdesc);
@@ -139,91 +141,255 @@ spock_prepare_row_filter(Node *row_filter)
 	return exprstate;
 }
 
+/*
+ * remove_table_from_repsets
+ *		removes given table from the other replication sets.
+ */
 static void
-spock_start_truncate(void)
+remove_table_from_repsets(Oid nodeid, Oid reloid, bool only_for_update)
 {
-	spock_truncated_tables = NIL;
+	ListCell *lc;
+	List *repsets;
+
+	repsets = get_table_replication_sets(nodeid, reloid);
+	foreach(lc, repsets)
+	{
+		SpockRepSet	   *rs = (SpockRepSet *) lfirst(lc);
+
+		if (only_for_update)
+		{
+			if (rs->replicate_update || rs->replicate_delete)
+				replication_set_remove_table(rs->id, reloid, true);
+		}
+		else
+			replication_set_remove_table(rs->id, reloid, true);
+	}
 }
 
+/*
+ * add_ddl_to_repset
+ *		Check if the DDL statement can be added to the replication set. (For
+ * now only tables are added). The function also checks whether the table has
+ * needed indexes to be added to replication set. If not, they are ignored.
+ */
 static void
-spock_finish_truncate(void)
+add_ddl_to_repset(Node *parsetree)
 {
-	ListCell	   *tlc;
-	SpockLocalNode *local_node;
-	Oid				session_userid = GetUserId();
-	Oid				save_userid = 0;
-	int				save_sec_context = 0;
+	Relation	targetrel;
+	SpockRepSet *repset;
+	SpockLocalNode *node;
+	Oid		reloid = InvalidOid;
+	RangeVar   *relation = NULL;
+	List	   *reloids = NIL;
+	ListCell   *lc;
 
-	/* Elevate permissions to access spock objects */
-	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
-						   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
+	/* no need to proceed if spock_include_ddl_repset is off */
+	if (!spock_include_ddl_repset)
+		return;
 
-	/* If this is not a spock node, don't do anything. */
-	local_node = get_local_node(false, true);
-	if (!local_node || !list_length(spock_truncated_tables))
+	if (nodeTag(parsetree) == T_AlterTableStmt)
 	{
-		SetUserIdAndSecContext(save_userid, save_sec_context);
+		if (castNode(AlterTableStmt, parsetree)->objtype == OBJECT_TABLE)
+			relation = castNode(AlterTableStmt, parsetree)->relation;
+		else if (castNode(AlterTableStmt, parsetree)->objtype == OBJECT_INDEX)
+		{
+			ListCell *cell;
+			AlterTableStmt *atstmt = (AlterTableStmt *) parsetree;
+
+			foreach(cell, atstmt->cmds)
+			{
+				AlterTableCmd *cmd = (AlterTableCmd *) lfirst(cell);
+
+				if (cmd->subtype == AT_AttachPartition)
+				{
+					RangeVar   *rv = castNode(AlterTableStmt, parsetree)->relation;
+					Relation	indrel;
+
+					indrel = relation_openrv(rv, AccessShareLock);
+					reloid = IndexGetRelation(RelationGetRelid(indrel), false);
+					table_close(indrel, NoLock);
+				}
+			}
+
+			if (!OidIsValid(reloid))
+				return;
+		}
+		else
+		{
+			return;
+		}
+	}
+	else if (nodeTag(parsetree) == T_CreateStmt)
+		relation = castNode(CreateStmt, parsetree)->relation;
+	else if (nodeTag(parsetree) == T_CreateTableAsStmt &&
+			 castNode(CreateTableAsStmt, parsetree)->objtype == OBJECT_TABLE)
+		relation = castNode(CreateTableAsStmt, parsetree)->into->rel;
+	else if (nodeTag(parsetree) == T_CreateSchemaStmt)
+	{
+		ListCell *cell;
+		CreateSchemaStmt *cstmt = (CreateSchemaStmt *) parsetree;
+
+		foreach(cell, cstmt->schemaElts)
+		{
+			if (nodeTag(lfirst(cell)) == T_CreateStmt)
+				add_ddl_to_repset(lfirst(cell));
+		}
+		return;
+	}
+	else if (nodeTag(parsetree) == T_ExplainStmt)
+	{
+		ExplainStmt *stmt = (ExplainStmt *) parsetree;
+		bool		analyze = false;
+		ListCell   *cell;
+
+		/* Look through an EXPLAIN ANALYZE to the contained stmt */
+		foreach(cell, stmt->options)
+		{
+			DefElem    *opt = (DefElem *) lfirst(cell);
+
+			if (strcmp(opt->defname, "analyze") == 0)
+				analyze = defGetBoolean(opt);
+			/* don't "break", as explain.c will use the last value */
+		}
+
+		if (analyze &&
+			castNode(Query, stmt->query)->commandType == CMD_UTILITY)
+			add_ddl_to_repset(castNode(Query, stmt->query)->utilityStmt);
+
+		return;
+	}
+	else
+	{
+		/* only tables are added to repset. */
 		return;
 	}
 
-	foreach (tlc, spock_truncated_tables)
+	node = get_local_node(false, true);
+	if (!node)
+		return;
+
+	if (OidIsValid(reloid))
+		targetrel = RelationIdGetRelation(reloid);
+	else
+		targetrel = table_openrv(relation, AccessShareLock);
+
+	reloid = RelationGetRelid(targetrel);
+
+	if (targetrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		reloids = find_all_inheritors(reloid, NoLock, NULL);
+	else
+		reloids = lappend_oid(reloids, reloid);
+	table_close(targetrel, NoLock);
+
+	foreach (lc, reloids)
 	{
-		Oid			reloid = lfirst_oid(tlc);
-		char	   *nspname;
-		char	   *relname;
-		List	   *repsets;
-		StringInfoData	json;
+		reloid = lfirst_oid(lc);
+		targetrel = RelationIdGetRelation(reloid);
 
-		/* Format the query. */
-		nspname = get_namespace_name(get_rel_namespace(reloid));
-		relname = get_rel_name(reloid);
-
-		elog(DEBUG3, "truncating the table %s.%s", nspname, relname);
-
-		/* It's easier to construct json manually than via Jsonb API... */
-		initStringInfo(&json);
-		appendStringInfo(&json, "{\"schema_name\": ");
-		escape_json(&json, nspname);
-		appendStringInfo(&json, ",\"table_name\": ");
-		escape_json(&json, relname);
-		appendStringInfo(&json, "}");
-
-		repsets = get_table_replication_sets(local_node->node->id, reloid);
-
-		if (list_length(repsets))
+		/* UNLOGGED and TEMP relations cannot be part of replication set. */
+		if (!RelationNeedsWAL(targetrel))
 		{
-			List	   *repset_names = NIL;
-			ListCell   *rlc;
+			/* remove table from the repsets. */
+			remove_table_from_repsets(node->node->id, reloid, false);
 
-			foreach (rlc, repsets)
-			{
-				SpockRepSet	    *repset = (SpockRepSet *) lfirst(rlc);
-				repset_names = lappend(repset_names, pstrdup(repset->name));
-				elog(DEBUG1, "truncating the table %s.%s for %s repset",
-					 nspname, relname, repset->name);
-			}
+			table_close(targetrel, NoLock);
+			return;
+		}
 
-			/* Queue the truncate for replication. */
-			queue_message(repset_names, session_userid,
-						  QUEUE_COMMAND_TYPE_TRUNCATE, json.data);
+		if (targetrel->rd_indexvalid == 0)
+			RelationGetIndexList(targetrel);
+
+		/* choose the 'default' repset, if table has PK or replica identity defined. */
+		if (OidIsValid(targetrel->rd_pkindex) || OidIsValid(targetrel->rd_replidindex))
+		{
+			repset = get_replication_set_by_name(node->node->id, DEFAULT_REPSET_NAME, false);
+
+			/*
+			 * remove table from previous repsets, it will be added to 'default'
+			 * down below.
+			 */
+			remove_table_from_repsets(node->node->id, reloid, false);
+		}
+		else
+		{
+			repset = get_replication_set_by_name(node->node->id, DEFAULT_INSONLY_REPSET_NAME, false);
+			/*
+			 * no primary key defined. let's see if the table is part of any other
+			 * repset or not?
+			 */
+			remove_table_from_repsets(node->node->id, reloid, true);
+		}
+
+		if (!OidIsValid(targetrel->rd_replidindex) &&
+			(repset->replicate_update || repset->replicate_delete))
+		{
+			table_close(targetrel, NoLock);
+			return;
+		}
+
+		table_close(targetrel, NoLock);
+
+		/* Add if not already present. */
+		if (get_table_replication_row(repset->id, reloid, NULL, NULL) == NULL)
+		{
+			replication_set_add_table(repset->id, reloid, NIL, NULL);
+
+			elog(LOG, "table '%s' was added to '%s' replication set.",
+				 get_rel_name(reloid), repset->name);
 		}
 	}
+}
 
-	/* Restore original session permissions */
-	SetUserIdAndSecContext(save_userid, save_sec_context);
+static bool
+autoddl_can_proceed(ProcessUtilityContext context, NodeTag toplevel_stmt,
+					NodeTag stmt)
+{
+	/* Allow all toplevel statements. */
+	if (context == PROCESS_UTILITY_TOPLEVEL)
+		return true;
 
-	list_free(spock_truncated_tables);
-	spock_truncated_tables = NIL;
+	/*
+	 * Indicates a portion of a query. These statements should be handled by the
+	 * corresponding top-level query.
+	 */
+	if (context == PROCESS_UTILITY_SUBCOMMAND)
+		return false;
+
+	/*
+	 * When the ProcessUtility hook is invoked due to a function call (enabled
+	 * by allow_ddl_from_functions) or a query from the queue (with
+	 * in_spock_queue_ddl_command set to true), the context is rarely
+	 * PROCESS_UTILITY_TOPLEVEL. Handling the context when it is
+	 * PROCESS_UTILITY_TOPLEVEL is straightforward. In other cases, our
+	 * objective is to filter out CREATE|DROP EXTENSION and CREATE SCHEMA
+	 * statements, which execute scripts or subcommands lacking top-level
+	 * status. Therefore, we need to filter out these internal commands.
+	 *
+	 * The purpose of this filtering is to include only the main statement (or
+	 * query provided by the client) in autoddl. To achieve this, we store the
+	 * nodetag of these statements in 'toplevel_stmt' and verify if the
+	 * current statement matches it. If not, it indicates the invocation of
+	 * subcommands, which we disregard.
+	 *
+	 * All other statements are allowed without filtering.
+	 */
+	if (context != PROCESS_UTILITY_TOPLEVEL &&
+		(allow_ddl_from_functions || in_spock_queue_ddl_command))
+	{
+		if (toplevel_stmt != T_Invalid)
+			return toplevel_stmt == stmt;
+
+		return true;
+	}
+
+	return false;
 }
 
 static void
 spock_ProcessUtility(
 						 PlannedStmt *pstmt,
 						 const char *queryString,
-#if PG_VERSION_NUM >= 140000
 						 bool readOnlyTree,
-#endif
 						 ProcessUtilityContext context,
 						 ParamListInfo params,
 						 QueryEnvironment *queryEnv,
@@ -234,9 +400,13 @@ spock_ProcessUtility(
 						 QueryCompletion *qc)
 {
 	Node	   *parsetree = pstmt->utilityStmt;
+	static NodeTag toplevel_stmt = T_Invalid;
 #ifndef XCP
 	#define		sentToRemote NULL
 #endif
+	Oid			roleoid = InvalidOid;
+	Oid			save_userid = 0;
+	int			save_sec_context = 0;
 
 	dropping_spock_obj = false;
 
@@ -248,11 +418,34 @@ spock_ProcessUtility(
 						CreateCommandName(parsetree))));
 	}
 
-	if (nodeTag(parsetree) == T_TruncateStmt)
-		spock_start_truncate();
-
 	if (nodeTag(parsetree) == T_DropStmt)
-		spock_lastDropBehavior = ((DropStmt *)parsetree)->behavior;
+	{
+		/*
+		 * Allow one to drop replication tables without specifying the CASCADE
+		 * option when in auto ddl replicatino mode.
+		 */
+		if (spock_enable_ddl_replication || in_spock_queue_ddl_command)
+			spock_lastDropBehavior = DROP_CASCADE;
+		else
+			spock_lastDropBehavior = ((DropStmt *)parsetree)->behavior;
+	}
+
+	/*
+	 * When the context is not PROCESS_UTILITY_TOPLEVEL, it becomes
+	 * challenging to differentiate between scripted commands and subcommands
+	 * generated as a result of CREATE|DROP EXTENSION and CREATE SCHEMA
+	 * statements. In autoddl, we only include statements that directly
+	 * originate from the client. To accomplish this, we store the nodetag of
+	 * the top-level statements for later comparison in the
+	 * autoddl_can_proceed() function. If the tags do not match, it indicates
+	 * that the statement did not originate from the client but rather is a
+	 * subcommand generated internally.
+	 */
+	if (nodeTag(parsetree) == T_CreateExtensionStmt ||
+		nodeTag(parsetree) == T_CreateSchemaStmt ||
+		(nodeTag(parsetree) == T_DropStmt &&
+		 castNode(DropStmt, parsetree)->removeType == OBJECT_EXTENSION))
+		toplevel_stmt = nodeTag(parsetree);
 
 	/* There's no reason we should be in a long lived context here */
 	Assert(CurrentMemoryContext != TopMemoryContext
@@ -269,10 +462,62 @@ spock_ProcessUtility(
 								   sentToRemote,
 								   qc);
 
-	if (nodeTag(parsetree) == T_TruncateStmt)
-		spock_finish_truncate();
-}
+	roleoid = GetUserId();
 
+	/*
+	 * Check that we have a local node. We need to elevate access
+	 * because this is called as an executor Utility hook under the
+	 * session user, who not necessarily has access permission to
+	 * Spock extension objects.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
+							save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
+
+	/*
+	 * we don't want to replicate if it's coming from spock.queue. But we do
+	 * add tables to repset whenever there is one.
+	 */
+	if (in_spock_queue_ddl_command || in_spock_replicate_ddl_command)
+	{
+		/* if DDL is from spoc.queue, add it to the repset. */
+		if (in_spock_queue_ddl_command &&
+			autoddl_can_proceed(context, toplevel_stmt, nodeTag(parsetree)))
+		{
+			toplevel_stmt = T_Invalid;
+			add_ddl_to_repset(parsetree);
+		}
+
+		/*
+		 * Do Nothing else. Hook was called as a result of spock.replicate_ddl().
+		 * The action has already been taken, so no need for the duplication.
+		 */
+	}
+	else if (GetCommandLogLevel(parsetree) == LOGSTMT_DDL &&
+			 spock_enable_ddl_replication &&
+			 get_local_node(false, true))
+	{
+		if (autoddl_can_proceed(context, toplevel_stmt, nodeTag(parsetree)))
+		{
+			const char *curr_qry;
+			int			loc = pstmt->stmt_location;
+			int			len = pstmt->stmt_len;
+
+			toplevel_stmt = T_Invalid;
+			queryString = CleanQuerytext(queryString, &loc, &len);
+			curr_qry = pnstrdup(queryString, len);
+
+			spock_auto_replicate_ddl(curr_qry,
+									 list_make1(DEFAULT_INSONLY_REPSET_NAME),
+									 roleoid,
+									 parsetree);
+
+			add_ddl_to_repset(parsetree);
+		}
+	}
+	/* Restore previous session privileges */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
+}
 
 /*
  * Handle object drop.
@@ -367,11 +612,29 @@ spock_executor_init(void)
 	next_object_access_hook = object_access_hook;
 	object_access_hook = spock_object_access;
 
-	/* analyzer hook for spock readonly */
 	prev_post_parse_analyze_hook = post_parse_analyze_hook;
 	post_parse_analyze_hook = spock_post_parse_analyze;
 
-	/* executor hook for spock readonly */
 	prev_executor_start_hook = ExecutorStart_hook;
 	ExecutorStart_hook = spock_ExecutorStart;
+}
+
+void
+spock_ExecutorStart(QueryDesc *queryDesc, int eflags)
+{
+	spock_roExecutorStart(queryDesc, eflags);
+
+    if (prev_executor_start_hook)
+		prev_executor_start_hook(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
+}
+
+void
+spock_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
+{
+	spock_ropost_parse_analyze(pstate, query, jstate);
+
+	if (prev_post_parse_analyze_hook)
+		prev_post_parse_analyze_hook(pstate, query, jstate);
 }

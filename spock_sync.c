@@ -3,7 +3,7 @@
  * spock_sync.c
  *		table synchronization functions
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -165,6 +165,7 @@ dump_structure(SpockSubscription *sub, const char *destfile,
 	char	   *cmdargv[20];
 	int			cmdargc = 0;
 	bool		has_spk_origin;
+	bool		has_snowflake;
 	StringInfoData	s;
 
 	dsn = spk_get_connstr((char *) sub->origin_if->dsn, NULL, NULL, &err_msg);
@@ -193,14 +194,23 @@ dump_structure(SpockSubscription *sub, const char *destfile,
 	cmdargv[cmdargc++] = pstrdup(s.data);
 	resetStringInfo(&s);
 
-	/* Skip the spock_origin if it exists locally. */
+	/* Skip the spock_origin and snowflake if it exists locally. */
 	StartTransactionCommand();
 	has_spk_origin = OidIsValid(LookupExplicitNamespace("spock_origin",
+														true));
+	has_snowflake = OidIsValid(LookupExplicitNamespace("snowflake",
 														true));
 	CommitTransactionCommand();
 	if (has_spk_origin)
 	{
 		appendStringInfo(&s, "--exclude-schema=%s", "spock_origin");
+		cmdargv[cmdargc++] = pstrdup(s.data);
+		resetStringInfo(&s);
+	}
+
+	if (has_snowflake)
+	{
+		appendStringInfo(&s, "--exclude-schema=%s", "snowflake");
 		cmdargv[cmdargc++] = pstrdup(s.data);
 		resetStringInfo(&s);
 	}
@@ -300,9 +310,13 @@ ensure_replication_slot_snapshot(PGconn *sql_conn, PGconn *repl_conn,
 retry:
 	initStringInfo(&query);
 
-	appendStringInfo(&query, "CREATE_REPLICATION_SLOT \"%s\" LOGICAL %s%s",
-					 slot_name, "spock_output",
-					 use_failover_slot ? " FAILOVER" : "");
+	appendStringInfo(&query, "CREATE_REPLICATION_SLOT \"%s\" LOGICAL %s",
+					 slot_name, "spock_output");
+	/* TODO: Should we ever use FAILOVER here? */
+	/*
+	if (use_failover_slot)
+		appendStringInfo(&query, " FAILOVER");
+	*/
 
 
 	res = PQexec(repl_conn, query.data);
@@ -328,8 +342,9 @@ retry:
 			goto retry;
 		}
 
-		elog(ERROR, "could not create replication slot on provider: %s\n",
-			 PQresultErrorMessage(res));
+		elog(ERROR, "could not create replication slot on provider: %s\n"
+		     "query: %s",
+			 PQresultErrorMessage(res), query.data);
 	}
 
 	*lsn = DatumGetLSN(DirectFunctionCall1Coll(pg_lsn_in, InvalidOid,
@@ -822,6 +837,8 @@ spock_sync_worker_cleanup(SpockSubscription *sub)
 		/* emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
 			proc_exit(1);
+
+		CHECK_FOR_INTERRUPTS();
 	}
 
 	spock_drop_remote_slot(origin_conn, sub->slot_name);
@@ -831,11 +848,7 @@ spock_sync_worker_cleanup(SpockSubscription *sub)
 	if (replorigin_session_origin != InvalidRepOriginId)
 	{
 		replorigin_session_reset();
-#if PG_VERSION_NUM >= 140000
 		replorigin_drop_by_name(sub->slot_name, true, true);
-#else
-		replorigin_drop(replorigin_session_origin, true);
-#endif
 		replorigin_session_origin = InvalidRepOriginId;
 	}
 }
@@ -1880,6 +1893,8 @@ wait_for_sync_status_change(Oid subid, const char *nspname, const char *relname,
 		/* emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
 			proc_exit(1);
+
+		CHECK_FOR_INTERRUPTS();
 	}
 
 	(void) MemoryContextSwitchTo(old_ctx);
@@ -1911,7 +1926,7 @@ truncate_table(char *nspname, char *relname)
 	truncate = makeNode(TruncateStmt);
 	truncate->relations = list_make1(rv);
 	truncate->restart_seqs = false;
-	truncate->behavior = DROP_RESTRICT;
+	truncate->behavior = DROP_CASCADE;
 
 	/*
 	 * We use standard_ProcessUtility to process the truncate statement. This

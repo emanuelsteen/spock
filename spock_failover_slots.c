@@ -3,7 +3,7 @@
  * spock_failover_slot.c
  *          Postgres Failover Slots
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 2023, EnterpriseDB Corporation.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
@@ -22,13 +22,7 @@
 #include "pgstat.h"
 
 #include "access/genam.h"
-#if PG_VERSION_NUM >= 120000
 #include "access/table.h"
-#else
-#include "access/heapam.h"
-#define table_open heap_open
-#define table_close heap_close
-#endif
 #include "access/xact.h"
 #if PG_VERSION_NUM >= 150000
 #include "access/xlogrecovery.h"
@@ -38,9 +32,7 @@
 #include "catalog/pg_database.h"
 
 #include "postmaster/bgworker.h"
-#if PG_VERSION_NUM >= 130000
 #include "postmaster/interrupt.h"
-#endif
 
 #include "replication/decode.h"
 #include "replication/logical.h"
@@ -66,11 +58,6 @@
 #include "libpq-fe.h"
 #include "libpq/auth.h"
 #include "libpq/libpq.h"
-
-#if PG_VERSION_NUM < 130000
-#define SignalHandlerForConfigReload PostgresSigHupHandler
-#define GetWalRcvFlushRecPtr GetWalRcvWriteRecPtr
-#endif
 
 #define WORKER_NAP_TIME 60000L
 #define WORKER_WAIT_FEEDBACK 10000L
@@ -102,7 +89,7 @@ typedef struct FailoverSlotFilter
 /* Used for physical-before-logical ordering */
 static char *standby_slot_names_raw;
 static char *standby_slot_names_string = NULL;
-List *standby_slot_names = NIL;
+List *pg_standby_slot_names = NIL;
 int standby_slots_min_confirmed;
 XLogRecPtr standby_slot_names_oldest_flush_lsn = InvalidXLogRecPtr;
 
@@ -236,8 +223,8 @@ assign_standby_slot_names(const char *newval, void *extra)
 
 	if (standby_slot_names_string)
 		pfree(standby_slot_names_string);
-	if (standby_slot_names)
-		list_free(standby_slot_names);
+	if (pg_standby_slot_names)
+		list_free(pg_standby_slot_names);
 
 	/*
 	 * We must invalidate our idea of the oldest lsn in all the named slots if
@@ -248,7 +235,7 @@ assign_standby_slot_names(const char *newval, void *extra)
 	old_ctx = MemoryContextSwitchTo(TopMemoryContext);
 	standby_slot_names_string = pstrdup(newval);
 	(void) SplitIdentifierString(standby_slot_names_string, ',',
-								 &standby_slot_names);
+								 &pg_standby_slot_names);
 	(void) MemoryContextSwitchTo(old_ctx);
 }
 
@@ -266,22 +253,11 @@ remote_get_primary_slot_info(PGconn *conn, List *slot_filter)
 	StringInfoData query;
 
 	initStringInfo(&query);
-	if (PQserverVersion(conn) >= 140000)
-	{
-		appendStringInfoString(
-			&query,
-			"SELECT slot_name, plugin, database, two_phase, catalog_xmin, restart_lsn, confirmed_flush_lsn"
-			"  FROM pg_catalog.pg_replication_slots"
-			" WHERE database IS NOT NULL AND (");
-	}
-	else
-	{
-		appendStringInfoString(
-			&query,
-			"SELECT slot_name, plugin, database, false AS two_phase, catalog_xmin, restart_lsn, confirmed_flush_lsn"
-			"  FROM pg_catalog.pg_replication_slots"
-			" WHERE database IS NOT NULL AND (");
-	}
+	appendStringInfoString(
+		&query,
+		"SELECT slot_name, plugin, database, two_phase, catalog_xmin, restart_lsn, confirmed_flush_lsn"
+		"  FROM pg_catalog.pg_replication_slots"
+		" WHERE database IS NOT NULL AND (");
 
 	foreach (lc, slot_filter)
 	{
@@ -416,14 +392,10 @@ get_database_oid(const char *dbname)
 
 	/* Must copy tuple before releasing buffer */
 	if (HeapTupleIsValid(tuple))
-#if PG_VERSION_NUM < 120000
-		dboid = HeapTupleGetOid(tuple);
-#else
 	{
 		Form_pg_database datForm = (Form_pg_database) GETSTRUCT(tuple);
 		dboid = datForm->oid;
 	}
-#endif
 	else
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_DATABASE),
 						errmsg("database \"%s\" does not exist", dbname)));
@@ -765,11 +737,14 @@ synchronize_one_slot(RemoteSlot *remote_slot)
 		 * We have to create the slot to reserve its name and resources, but
 		 * don't want it to persist if we fail.
 		 */
-#if PG_VERSION_NUM >= 140000
+#if PG_VERSION_NUM >= 170000
+		ReplicationSlotCreate(remote_slot->name, true, RS_EPHEMERAL,
+							  remote_slot->two_phase,
+							  false,
+							  false);
+#else
 		ReplicationSlotCreate(remote_slot->name, true, RS_EPHEMERAL,
 							  remote_slot->two_phase);
-#else
-		ReplicationSlotCreate(remote_slot->name, true, RS_EPHEMERAL);
 #endif
 		slot = MyReplicationSlot;
 
@@ -1131,38 +1106,38 @@ list_member_str(List *l, const char *str)
 
 
 /*
- * Check whether we want to actually wait for standby_slot_names
+ * Check whether we want to actually wait for pg_standby_slot_names
  */
 static bool
 skip_standby_slot_names(XLogRecPtr commit_lsn)
 {
 	static List *cached_standby_slot_names = NIL;
 
-	if (standby_slot_names != cached_standby_slot_names)
+	if (pg_standby_slot_names != cached_standby_slot_names)
 	{
 		if (MyReplicationSlot)
 		{
-			if (list_member_str(standby_slot_names,
+			if (list_member_str(pg_standby_slot_names,
 								NameStr(MyReplicationSlot->data.name)))
 			{
 				standby_slots_min_confirmed = 0;
 				elog(
 					DEBUG1,
-					"found my slot in spock_failover_slots.standby_slot_names, no need to wait for confirmations");
+					"found my slot in spock_failover_slots.pg_standby_slot_names, no need to wait for confirmations");
 			}
 		}
 
-		cached_standby_slot_names = standby_slot_names;
+		cached_standby_slot_names = pg_standby_slot_names;
 	}
 
 	/*
 	 * If we already know all slots of interest satisfy the requirement we can
 	 * skip checks entirely. The assignment hook for
-	 * spock_failover_slots.standby_slot_names invalidates the cache.
+	 * spock_failover_slots.pg_standby_slot_names invalidates the cache.
 	 */
 	if (standby_slot_names_oldest_flush_lsn >= commit_lsn ||
 		standby_slots_min_confirmed == 0 ||
-		list_length(standby_slot_names) == 0)
+		list_length(pg_standby_slot_names) == 0)
 		return true;
 
 	return false;
@@ -1197,23 +1172,23 @@ wait_for_standby_confirmation(XLogRecPtr commit_lsn)
 		{
 			/*
 			 * Default spock_failover_slots.standby_slots_min_confirmed (-1) is to
-			 * wait for all entries in spock_failover_slots.standby_slot_names.
+			 * wait for all entries in spock_failover_slots.pg_standby_slot_names.
 			 */
-			wait_slots_remaining = list_length(standby_slot_names);
+			wait_slots_remaining = list_length(pg_standby_slot_names);
 		}
 		else
 		{
 			/*
 			 * spock_failover_slots.standby_slots_min_confirmed cannot wait for
 			 * more slots than are named in the
-			 * spock_failover_slots.standby_slot_names.
+			 * spock_failover_slots.pg_standby_slot_names.
 			 */
 			wait_slots_remaining = Min(standby_slots_min_confirmed,
-									   list_length(standby_slot_names));
+									   list_length(pg_standby_slot_names));
 		}
 
 		Assert(wait_slots_remaining > 0 &&
-			   wait_slots_remaining <= list_length(standby_slot_names));
+			   wait_slots_remaining <= list_length(pg_standby_slot_names));
 
 		LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
 		for (i = 0; i < max_replication_slots; i++)
@@ -1223,7 +1198,7 @@ wait_for_standby_confirmation(XLogRecPtr commit_lsn)
 			if (!s->in_use)
 				continue;
 
-			if (!list_member_str(standby_slot_names, NameStr(s->data.name)))
+			if (!list_member_str(pg_standby_slot_names, NameStr(s->data.name)))
 				continue;
 
 			SpinLockAcquire(&s->mutex);
@@ -1290,7 +1265,7 @@ wait_for_standby_confirmation(XLogRecPtr commit_lsn)
 			ereport(
 				COMMERROR,
 				(errmsg(
-					"terminating walsender process due to spock_failover_slots.standby_slot_names replication timeout")));
+					"terminating walsender process due to spock_failover_slots.pg_standby_slot_names replication timeout")));
 			proc_exit(0);
 		}
 
@@ -1368,32 +1343,11 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 	OldPqCommMethods->putmessage_noblock(msgtype, s, len);
 }
 
-#if PG_VERSION_NUM < 140000
-static void
-socket_startcopyout(void)
-{
-	OldPqCommMethods->startcopyout();
-}
 
-static void
-socket_endcopyout(bool errorAbort)
-{
-	OldPqCommMethods->endcopyout(errorAbort);
-}
-#endif
-
-
-#if PG_VERSION_NUM >= 120000
 static const
-#else
-static
-#endif
 	PQcommMethods PqCommSocketMethods = {
 		socket_comm_reset,		socket_flush,	   socket_flush_if_writable,
 		socket_is_send_pending, socket_putmessage, socket_putmessage_noblock
-#if PG_VERSION_NUM < 140000
-		, socket_startcopyout, socket_endcopyout
-#endif
 	};
 
 static ClientAuthentication_hook_type original_client_auth_hook = NULL;
@@ -1420,7 +1374,7 @@ spock_init_failover_slot(void)
 	BackgroundWorker bgw;
 
 	DefineCustomStringVariable(
-		"spock.standby_slot_names",
+		"spock.pg_standby_slot_names",
 		"list of names of slot that must confirm changes before they're sent by the decoding plugin",
 		"List of physical replication slots that must confirm durable "
 		"flush of a given lsn before commits up to that lsn may be "
@@ -1433,12 +1387,12 @@ spock_init_failover_slot(void)
 
 	DefineCustomIntVariable(
 		"spock.standby_slots_min_confirmed",
-		"Number of slots from spock_failover_slots.standby_slot_names that must confirm lsn",
-		"Modifies behaviour of spock_failover_slots.standby_slot_names so to allow "
+		"Number of slots from spock_failover_slots.pg_standby_slot_names that must confirm lsn",
+		"Modifies behaviour of spock_failover_slots.pg_standby_slot_names so to allow "
 		"logical replication of a transaction after at least "
 		"spock_failover_slots.standby_slots_min_confirmed physical peers have confirmed "
 		"the transaction as durably flushed. "
-		"The value -1 (default) means all entries in spock_failover_slots.standby_slot_names"
+		"The value -1 (default) means all entries in spock_failover_slots.pg_standby_slot_names"
 		"must confirm the write. The value 0 causes "
 		"spock_failover_slots.standby_slots_min_confirmedto be effectively ignored.",
 		&standby_slots_min_confirmed, -1, -1, 100, PGC_SIGHUP, 0, NULL, NULL,

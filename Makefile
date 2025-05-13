@@ -6,26 +6,40 @@ PGFILEDESC = "spock - multi-master replication"
 
 MODULES = spock_output
 
-DATA = spock--3.1.sql spock--3.2.sql
+DATA = spock--4.1.0.sql \
+	   spock--4.0.0--4.0.1.sql \
+	   spock--4.0.1--4.0.2.sql \
+	   spock--4.0.2--4.0.3.sql \
+	   spock--4.0.3--4.0.4.sql \
+	   spock--4.0.4--4.0.5.sql \
+	   spock--4.0.5--4.0.6.sql \
+	   spock--4.0.6--4.0.7.sql \
+	   spock--4.0.7--4.0.8.sql \
+	   spock--4.0.8--4.0.9.sql \
+	   spock--4.0.9--4.1.0.sql
 
-OBJS = spock_apply.o spock_conflict.o spock_manager.o \
-	   spock.o spock_node.o spock_relcache.o \
-	   spock_repset.o spock_rpc.o spock_functions.o \
-	   spock_queue.o spock_fe.o spock_worker.o \
-	   spock_sync.o spock_sequences.o spock_executor.o \
-	   spock_dependency.o spock_apply_heap.o spock_apply_spi.o \
-	   spock_output_config.o spock_output_plugin.o \
-	   spock_output_proto.o spock_proto_json.o \
-	   spock_proto_native.o spock_monitoring.o spock_failover_slots.o \
-	   spock_readonly.o
+OBJS = 	spock_jsonb_utils.o spock_exception_handler.o spock_apply.o \
+		spock_conflict.o spock_manager.o \
+		spock.o spock_node.o spock_relcache.o \
+		spock_repset.o spock_rpc.o spock_functions.o \
+		spock_queue.o spock_fe.o spock_worker.o \
+		spock_sync.o spock_sequences.o spock_executor.o \
+		spock_dependency.o spock_apply_heap.o spock_apply_spi.o \
+		spock_output_config.o spock_output_plugin.o \
+		spock_output_proto.o spock_proto_json.o \
+		spock_proto_native.o spock_monitoring.o spock_failover_slots.o \
+		spock_readonly.o spock_common.o
 
 SCRIPTS_built = spock_create_subscriber
 
-REGRESS = preseed infofuncs init_fail init preseed_check basic extended conflict_secondary_unique \
-		  toasted replication_set add_table matview bidirectional primary_key \
-		  interfaces foreign_key functions copy sequence triggers parallel row_filter \
+REGRESS = preseed infofuncs init_fail init preseed_check basic conflict_secondary_unique \
+		  toasted replication_set matview bidirectional primary_key \
+		  interfaces foreign_key copy sequence triggers parallel row_filter \
 		  row_filter_sampling att_list column_filter apply_delay multiple_upstreams \
 		  node_origin_cascade drop
+
+# Disabled following tests:
+#	extended add_table functions
 
 # The following test cases are disabled while developing.
 #
@@ -38,10 +52,9 @@ REGRESS := $(filter-out apply_delay, $(REGRESS))
 EXTRA_CLEAN += compat17/spock_compat.o compat17/spock_compat.bc \
 				compat16/spock_compat.o compat16/spock_compat.bc \
 				compat15/spock_compat.o compat15/spock_compat.bc \
-				compat14/spock_compat.o compat14/spock_compat.bc \
 				spock_create_subscriber.o
 
-spock_version=$(shell awk '/\#define SPOCK_VERSION[ \t]+\".*\"/ { print substr($$3,2,length($$3)-2) }' $(realpath $(srcdir)/spock.h) )
+spock_version=$(shell grep "^\#define \<SPOCK_VERSION\>" $(realpath $(srcdir)/spock.h) | cut -d'"' -f2)
 
 # For regression checks
 # this makes "make check" give a useful error

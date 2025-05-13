@@ -68,9 +68,6 @@
 
 #define Form_pg_sequence Form_pg_sequence_data
 
-#define InitResultRelInfo(resultRelInfo, resultRelationDesc, resultRelationIndex, instrument_options) \
-	InitResultRelInfo(resultRelInfo, resultRelationDesc, resultRelationIndex, NULL, instrument_options)
-
 #define ExecARUpdateTriggers(estate, relinfo, tupleid, fdw_trigtuple, newslot, recheckIndexes) \
 	ExecARUpdateTriggers(estate, relinfo, NULL, NULL, tupleid, fdw_trigtuple, newslot, recheckIndexes, NULL, false)
 
@@ -79,8 +76,6 @@
 
 #define ExecARDeleteTriggers(estate, relinfo, tupleid, fdw_trigtuple) \
 	ExecARDeleteTriggers(estate, relinfo, tupleid, fdw_trigtuple, NULL, false)
-
-#define makeDefElem(name, arg) makeDefElem(name, arg, -1)
 
 #define SPKstandard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, sentToRemote, qc) \
 	standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc)
@@ -100,13 +95,6 @@
 	} while (false);
 
 #define SPKReplicationSlotCreate(name, db_specific, persistency) ReplicationSlotCreate(name, db_specific, persistency)
-
-#ifndef rbtxn_has_catalog_changes
-#define rbtxn_has_catalog_changes(txn) (txn->has_catalog_changes)
-#endif
-
-#define ExecInitExtraTupleSlot(estate) \
-	ExecInitExtraTupleSlot(estate, NULL, &TTSOpsHeapTuple)
 
 #define ACL_OBJECT_RELATION OBJECT_TABLE
 #define ACL_OBJECT_SEQUENCE OBJECT_SEQUENCE
@@ -128,7 +116,8 @@
 		simple_heap_update(relation, otid, tup, &updateIndexes);	\
 	} while (false);
 
-#define EvalPlanQualInit(epqstate, parentestate, subplan, auxrowmarks, epqParam) \
-	EvalPlanQualInit(epqstate, parentestate, subplan, auxrowmarks, epqParam, NIL)
+/* Must use this interface for access HeapTuple in ReorderBufferChange */
+#define ReorderBufferChangeHeapTuple(change, tuple_type) \
+	&change->data.tp.tuple_type->tuple
 
 #endif

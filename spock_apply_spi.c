@@ -3,7 +3,7 @@
  * spock_apply_spi.c
  * 		spock apply functions using SPI
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -507,15 +507,9 @@ spock_proccess_copy(spock_copyState *spkcstate)
 	save_stdin = stdin;
 	stdin = spkcstate->copy_read_file;
 
-	/* COPY may call into SPI (triggers, ...) and we already are in SPI. */
-	SPI_push();
-
 	/* Initiate the actual COPY */
 	SPKDoCopy((CopyStmt*)((RawStmt *)linitial(spkcstate->copy_parsetree))->stmt,
 		spkcstate->copy_stmt->data, &processed);
-
-	/* Clean up SPI state */
-	SPI_pop();
 
 	fclose(spkcstate->copy_read_file);
 	spkcstate->copy_read_file = NULL;

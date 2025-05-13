@@ -3,7 +3,7 @@
  * spock.h
  *              spock replication extension
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -16,6 +16,7 @@
 #include "postmaster/bgworker.h"
 #include "utils/array.h"
 #include "access/xlogdefs.h"
+#include "parser/analyze.h"
 #include "executor/executor.h"
 
 #include "libpq-fe.h"
@@ -25,27 +26,33 @@
 
 #include "spock_compat.h"
 
-#define SPOCK_VERSION "3.2"
-#define SPOCK_VERSION_NUM 30200
-
-#define SPOCK_MIN_PROTO_VERSION_NUM 1
-#define SPOCK_MAX_PROTO_VERSION_NUM 1
+#define SPOCK_VERSION "4.1.0"
+#define SPOCK_VERSION_NUM 40100
 
 #define EXTENSION_NAME "spock"
 
-#define REPLICATION_ORIGIN_ALL "all"
+#define REPLICATION_ORIGIN_ALL	"all"
+
+/* define prefix for the MESSAGE callback */
+#define SPOCK_MESSAGE_PREFIX	"Spock"
 
 #define HAVE_REPLICATION_ORIGINS
+
+/* Min allowed value for restart_delay_default GUC */
+#define SPOCK_RESTART_MIN_DELAY 1
 
 extern bool spock_synchronous_commit;
 extern char *spock_temp_directory;
 extern bool spock_use_spi;
-extern int	spock_ctt_prune_interval;
 extern bool spock_batch_inserts;
 extern char *spock_extra_connection_options;
 extern bool	spock_ch_stats;
 extern bool	spock_deny_ddl;
-
+extern bool	spock_enable_ddl_replication;
+extern bool	spock_include_ddl_repset;
+extern bool	allow_ddl_from_functions;
+extern int	restart_delay_default;
+extern int	restart_delay_on_exception;
 extern char *shorten_hash(const char *str, int maxlen);
 
 extern List *textarray_to_list(ArrayType *textarray);
@@ -83,6 +90,13 @@ extern void spock_drop_sequence_state_record(Oid seqoid);
 extern int64 sequence_get_last_value(Oid seqoid);
 
 extern bool in_spock_replicate_ddl_command;
+extern bool in_spock_queue_ddl_command;
+extern void spock_auto_replicate_ddl(const char *query, List *replication_sets,
+									 Oid roleoid, Node *stmt);
+
+/* spock_readonly.c */
+void spock_roExecutorStart(QueryDesc *queryDesc, int eflags);
+void spock_ropost_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate);
 
 #include "utils/memdebug.h"
 

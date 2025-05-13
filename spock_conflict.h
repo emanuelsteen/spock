@@ -3,7 +3,7 @@
  * spock_conflict.h
  *		spock conflict detection and resolution
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -21,9 +21,6 @@
 /* conflict log table */
 #define CATALOG_LOGTABLE "resolutions"
 #define SPOCK_LOG_TABLE_COLS 16
-
-/* Conflict tracking permanent table */
-#define	SPOCK_CTT_NAME	 "conflict_tracker"
 
 extern TransactionId remote_xid;
 
@@ -64,9 +61,9 @@ extern Oid spock_tuple_find_conflict(ResultRelInfo *relinfo,
 										 SpockTupleData *tuple,
 										 TupleTableSlot *oldslot);
 
-extern bool get_tuple_origin(Oid relid, HeapTuple local_tuple, ItemPointer tid,
-							 TransactionId *xmin, RepOriginId *local_origin,
-							 TimestampTz *local_ts);
+extern bool get_tuple_origin(SpockRelation *rel, HeapTuple local_tuple,
+							 ItemPointer tid, TransactionId *xmin,
+							 RepOriginId *local_origin, TimestampTz *local_ts);
 
 extern bool try_resolve_conflict(Relation rel, HeapTuple localtuple,
 								 HeapTuple remotetuple, HeapTuple *resulttuple,
@@ -106,12 +103,7 @@ extern Oid get_conflict_log_seq(void);
 extern bool spock_conflict_resolver_check_hook(int *newval, void **extra,
 									   GucSource source);
 
-/*
- * Support functions for conflict tracking table
- */
-extern void spock_ctt_store(Oid relid, ItemPointer tid,
-							RepOriginId last_origin, TransactionId last_xmin,
-							TimestampTz last_ts);
-extern int32 spock_ctt_prune(void);
-extern void spock_ctt_close(void);
+extern void tuple_to_stringinfo(StringInfo s, TupleDesc tupdesc,
+	HeapTuple tuple);
+
 #endif /* SPOCK_CONGLICT_H */

@@ -3,7 +3,7 @@
  * spock_node.c
  *		spock node and subscription catalog manipulation functions
  *
- * Copyright (c) 2022-2023, pgEdge, Inc.
+ * Copyright (c) 2022-2024, pgEdge, Inc.
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, The Regents of the University of California
  *
@@ -34,7 +34,11 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/pg_lsn.h"
 #include "utils/rel.h"
+#include "fmgr.h"
+#include "funcapi.h"
+
 
 #include "spock_node.h"
 #include "spock_repset.h"
@@ -89,7 +93,7 @@ typedef struct SubscriptionTuple
 	NameData	sub_slot_name;
 } SubscriptionTuple;
 
-#define Natts_subscription			12
+#define Natts_subscription			13
 #define Anum_sub_id					1
 #define Anum_sub_name				2
 #define Anum_sub_origin				3
@@ -102,6 +106,7 @@ typedef struct SubscriptionTuple
 #define Anum_sub_forward_origins	10
 #define Anum_sub_apply_delay		11
 #define Anum_sub_force_text_transfer 12
+#define Anum_sub_skip_lsn			13
 
 /*
  * We impose same validation rules as replication slot name validation does.
@@ -158,7 +163,7 @@ create_node(SpockNode *node)
 	if (node->id == InvalidOid)
 		node->id =
 			DatumGetUInt32(hash_any((const unsigned char *) node->name,
-									strlen(node->name)));
+									strlen(node->name))) & 0xffff;
 
 	rv = makeRangeVar(EXTENSION_NAME, CATALOG_NODE, -1);
 	rel = table_openrv(rv, RowExclusiveLock);
@@ -244,25 +249,74 @@ node_fromtuple(HeapTuple tuple, TupleDesc desc)
 	NodeTuple *nodetup = (NodeTuple *) GETSTRUCT(tuple);
 	Datum	datum;
 	bool	isnull;
-	SpockNode *node
-		= (SpockNode *) palloc0(sizeof(SpockNode));
+
+	SpockNode *node = (SpockNode *) palloc0(sizeof(SpockNode));
 	node->id = nodetup->node_id;
 	node->name = pstrdup(NameStr(nodetup->node_name));
 
+	/* location */
 	datum = heap_getattr(tuple, Anum_node_location, desc, &isnull);
 	if (!isnull)
 		node->location = TextDatumGetCString(datum);
 
+	/* country */
 	datum = heap_getattr(tuple, Anum_node_country, desc, &isnull);
 	if (!isnull)
 		node->country = TextDatumGetCString(datum);
 
+	/* info (JSONB) */
 	datum = heap_getattr(tuple, Anum_node_info, desc, &isnull);
 	if (!isnull)
+	{
+		Datum value;
+		int32 intval;
+		FmgrInfo flinfo;
+		FunctionCallInfo fcinfo;
+		bool isnullval;
+
 		node->info = DatumGetJsonbP(datum);
+
+		/*
+		 * The node entry has jsonb info, try to extract the
+		 * tiebreaker value from that. If it isn't set we
+		 * fallback to the node-id.
+		 */
+
+		/* Set up function call info for jsonb_object_field_text(jsonb, text) */
+		fmgr_info(F_JSONB_OBJECT_FIELD_TEXT, &flinfo);
+
+		/* Allocate and initialize the call info structure */
+		fcinfo = palloc0(SizeForFunctionCallInfo(2));
+		InitFunctionCallInfoData(*fcinfo, &flinfo, 2, InvalidOid, NULL, NULL);
+
+		fcinfo->args[0].value = PointerGetDatum(node->info);
+		fcinfo->args[0].isnull = false;
+		fcinfo->args[1].value = CStringGetTextDatum("tiebreaker");
+		fcinfo->args[1].isnull = false;
+
+		value = FunctionCallInvoke(fcinfo);
+		isnullval = fcinfo->isnull;
+
+		if (!isnullval)
+		{
+			intval = pg_strtoint32(TextDatumGetCString(value));
+			node->tiebreaker = intval;
+		}
+		else
+		{
+			node->tiebreaker = node->id;
+		}
+
+		pfree(fcinfo);
+	}
+	else
+	{
+		node->tiebreaker = node->id;
+	}
 
 	return node;
 }
+
 
 /*
  * Load the info for specific node.
@@ -773,6 +827,7 @@ create_subscription(SpockSubscription *sub)
 		nulls[Anum_sub_apply_delay - 1] = true;
 
 	values[Anum_sub_force_text_transfer - 1] = BoolGetDatum(sub->force_text_transfer);
+	values[Anum_sub_skip_lsn - 1] = LSNGetDatum(sub->skiplsn);
 
 	tup = heap_form_tuple(tupDesc, values, nulls);
 
@@ -858,6 +913,7 @@ alter_subscription(SpockSubscription *sub)
 
 	values[Anum_sub_apply_delay - 1] = IntervalPGetDatum(sub->apply_delay);
 	values[Anum_sub_force_text_transfer - 1] = BoolGetDatum(sub->force_text_transfer);
+	values[Anum_sub_skip_lsn - 1] = LSNGetDatum(sub->skiplsn);
 
 	newtup = heap_modify_tuple(oldtup, tupDesc, values, nulls, replaces);
 
@@ -967,6 +1023,13 @@ subscription_fromtuple(HeapTuple tuple, TupleDesc desc)
 		sub->force_text_transfer = false;
 	else
 		sub->force_text_transfer = DatumGetBool(d);
+
+	/* Get skip_lsn. */
+	d = fastgetattr(tuple, Anum_sub_skip_lsn, desc, &isnull);
+	if (isnull)
+		sub->skiplsn = InvalidXLogRecPtr;
+	else
+		sub->skiplsn = DatumGetLSN(d);
 
 	return sub;
 }

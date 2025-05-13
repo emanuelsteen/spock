@@ -1,0 +1,29 @@
+FROM rockylinux:9
+
+ARG PGVER
+
+ENV PGVER=$PGVER
+
+RUN dnf -y install sudo && dnf -y groupinstall "Development Tools"
+
+RUN useradd -m pgedge -s /bin/bash && \
+    echo pgedge:asdf | chpasswd && \
+    echo "pgedge ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/pgedge && \
+    chmod 0440 /etc/sudoers.d/pgedge && \
+    chown -R pgedge:pgedge /home/pgedge
+
+COPY lib-list.txt /home/pgedge/
+
+RUN dnf install --allowerasing --enablerepo=crb -y $(cat /home/pgedge/lib-list.txt)
+
+RUN ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 && \
+    cat ~/.ssh/*.pub >> ~/.ssh/authorized_keys
+
+COPY entrypoint.sh run-tests.sh /home/pgedge
+
+RUN sudo chmod +x /home/pgedge/entrypoint.sh /home/pgedge/run-tests.sh
+
+WORKDIR /home/pgedge/
+USER pgedge
+
+CMD ["/home/pgedge/entrypoint.sh"]
